@@ -1,18 +1,21 @@
-(/**
+(function () {
+/**
  * TikTok Repost Ultimate v4.0
  * --------------------------
  * Công cụ quản lý TikTok chuyên nghiệp
  * Phát triển bởi: Nguyễn Văn Kiên (kien234)
  * Website: https://github.com/kien234
- * 
+ *
  * Bản quyền thuộc về Nguyễn Văn Kiên. Vui lòng không sao chép trái phép.
  */
-function () {
     const originalFetch = window.fetch;
     window.allRepostVideos = [];
-    window.allFollowers = [];
+    window.allFollowing = [];
     window.allFavorites = [];
     window.allLikedVideos = [];
+    /** Map id → aweme/item object (đổ metadata từ API feed trên trang) */
+    window.truAwemeById = Object.create(null);
+    window.truAwemeIdQueue = [];
     window.tiktokExtensionActivated = false;
     window.tiktokLastUrlObj = null;
 
@@ -55,39 +58,1076 @@ function () {
     }
 
     // --- UTILS ---
+    const TRU_CACHE_KEY = 'tiktok_extension_verified_user';
+
+    function getCachedUserProfile() {
+        try {
+            const r = localStorage.getItem(TRU_CACHE_KEY);
+            if (!r) return null;
+            return JSON.parse(r);
+        } catch (e) {
+            return null;
+        }
+    }
+
+    function getPageKind() {
+        const path = window.location.pathname || '/';
+        const isProfilePath = /^\/@[^/]+(\/)?$/.test(path);
+        if (!isProfilePath) return 'feed';
+        const editBtn = document.querySelector('[data-e2e="edit-profile-entrance"]') ||
+            document.querySelector('button[class*="Edit"]');
+        return editBtn ? 'own' : 'other';
+    }
+
+    /** Tránh quét toàn bộ DOM `video` 60fps — gây lag khi TikTok preload nhiều clip */
+    let _truBestVidCache = null;
+    let _truBestVidScanAt = 0;
+    const TRU_BEST_VIDEO_SCAN_MS = 350;
+    /** Chọn video TikTok đang phát, ưu tiên khung hình lớn trong viewport. `force`= true bỏ cache (tải, F5…) */
+    function findBestFeedVideo(force) {
+        const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
+        if (!force && _truBestVidCache && typeof document !== 'undefined' && document.contains(_truBestVidCache)) {
+            if (now - _truBestVidScanAt < TRU_BEST_VIDEO_SCAN_MS) return _truBestVidCache;
+        }
+        _truBestVidScanAt = now;
+        const videos = Array.from(document.querySelectorAll('video'));
+        let best = null;
+        let bestArea = 0;
+        for (const v of videos) {
+            if (v.readyState < 2) continue;
+            const r = v.getBoundingClientRect();
+            if (r.width < 80 || r.height < 80) continue;
+            const top = Math.max(r.top, 0);
+            const bottom = Math.min(r.bottom, window.innerHeight);
+            const visibleH = Math.max(0, bottom - top);
+            if (visibleH < 40) continue;
+            const area = r.width * visibleH;
+            if (!v.paused && area > bestArea) {
+                bestArea = area;
+                best = v;
+            }
+        }
+        if (best) {
+            _truBestVidCache = best;
+            return best;
+        }
+        for (const v of videos) {
+            if (!v.paused && v.readyState >= 2) {
+                _truBestVidCache = v;
+                return v;
+            }
+        }
+        _truBestVidCache = videos[0] || null;
+        return _truBestVidCache;
+    }
+
+    /** Gộp nhiều feed JSON chỉ làm một lần cập nhật panel → giảm jank */
+    let _truDebouncedPanelRefreshTimer = null;
+    function scheduleRefreshTruViewerPanel() {
+        if (_truDebouncedPanelRefreshTimer != null) clearTimeout(_truDebouncedPanelRefreshTimer);
+        _truDebouncedPanelRefreshTimer = setTimeout(() => {
+            _truDebouncedPanelRefreshTimer = null;
+            refreshTruViewerPanel();
+        }, 420);
+    }
+
+    const TRU_AWEME_CACHE_MAX = 500;
+
+    function truNormalizeAwemeId(item) {
+        if (!item) return '';
+        const id = item.aweme_id ?? item.awemeId ?? item.id ?? item.stats?.aweme_id;
+        return id != null && String(id).trim() !== '' ? String(id).trim() : '';
+    }
+
+    function truIngestAwemeItems(items) {
+        if (!Array.isArray(items) || !items.length) return;
+        const q = window.truAwemeIdQueue;
+        const map = window.truAwemeById;
+        for (let i = 0; i < items.length; i++) {
+            const item = items[i];
+            const id = truNormalizeAwemeId(item);
+            if (!id) continue;
+            const wasNew = !(id in map);
+            map[id] = item;
+            if (wasNew) q.push(id);
+        }
+        while (q.length > TRU_AWEME_CACHE_MAX) {
+            const rm = q.shift();
+            if (rm != null) delete map[rm];
+        }
+    }
+
+    /** URL API TikTok thường trả itemList chứa play_addr / download_addr / image_post_info */
+    function truIsLikelyAwemeFeedApi(fullUrl) {
+        if (!fullUrl || typeof fullUrl !== 'string') return false;
+        let u = fullUrl;
+        try {
+            if (!/^https?:\/\//i.test(u)) u = new URL(u, location.origin).href;
+        } catch (e) { return false; }
+        if (!/\/api\//i.test(u)) return false;
+        if (/item_list/i.test(u)) return true;
+        return /\/api\/(recommend|feed|following|homepage|browse|related|challenge|music|explore|poi|discovery|general|friend|business)\b/i.test(u);
+    }
+
+    function truExtractItemListsFromPayload(d) {
+        const out = [];
+        if (!d || typeof d !== 'object') return out;
+        if (Array.isArray(d.itemList)) out.push(d.itemList);
+        if (Array.isArray(d.item_list)) out.push(d.item_list);
+        if (Array.isArray(d.items)) out.push(d.items);
+        if (d.aweme_detail && typeof d.aweme_detail === 'object') out.push([d.aweme_detail]);
+        const data = d.data;
+        if (data && typeof data === 'object') {
+            if (Array.isArray(data.itemList)) out.push(data.itemList);
+            if (Array.isArray(data.item_list)) out.push(data.item_list);
+            if (Array.isArray(data.items)) out.push(data.items);
+        }
+        return out;
+    }
+
+    function truProcessFeedJsonPayload(d) {
+        const lists = truExtractItemListsFromPayload(d);
+        for (let i = 0; i < lists.length; i++) truIngestAwemeItems(lists[i]);
+        scheduleRefreshTruViewerPanel();
+    }
+
+    /** Quét state nhúng (SIGI / hydration) — giúp có metadata ngay, không cần chỉ fetch/XHR. */
+    let _truLastEmbedHarvest = 0;
+    const TRU_EMBED_HARVEST_MS = 8000;
+    function truHarvestEmbeddedPageState() {
+        const now = Date.now();
+        if (now - _truLastEmbedHarvest < TRU_EMBED_HARVEST_MS) return;
+        _truLastEmbedHarvest = now;
+
+        let budget = 6000;
+        const visited = new WeakSet();
+        function walk(o, depth) {
+            if (budget-- <= 0 || depth > 14 || !o || typeof o !== 'object') return;
+            if (visited.has(o)) return;
+            visited.add(o);
+
+            const il = o.itemList || o.item_list;
+            if (Array.isArray(il) && il.length > 0) {
+                const first = il[0];
+                if (first && (first.video || first.aweme_id || first.id
+                    || first.image_post_info || first.imagePost)) {
+                    truIngestAwemeItems(il);
+                }
+            }
+            if (o.aweme_detail && typeof o.aweme_detail === 'object') {
+                const ad = o.aweme_detail;
+                if (ad.video || ad.id || ad.aweme_id) truIngestAwemeItems([ad]);
+            }
+
+            const keys = Object.keys(o);
+            if (keys.length > 100) return;
+            for (let i = 0; i < keys.length; i++) {
+                const v = o[keys[i]];
+                if (v && typeof v === 'object') walk(v, depth + 1);
+            }
+        }
+
+        try {
+            const roots = [
+                typeof window.SIGI_STATE !== 'undefined' ? window.SIGI_STATE : null,
+                typeof window.__UNIVERSAL_DATA_FOR_REHYDRATION__ !== 'undefined' ? window.__UNIVERSAL_DATA_FOR_REHYDRATION__ : null,
+            ];
+            for (let r = 0; r < roots.length; r++) {
+                if (roots[r]) walk(roots[r], 0);
+            }
+        } catch (e) { /* ignore */ }
+
+        try {
+            const scripts = document.querySelectorAll('script[id]');
+            for (let i = 0; i < scripts.length; i++) {
+                const el = scripts[i];
+                const id = (el.id || '').toUpperCase();
+                if (!/SIGI|UNIVERSAL|NEXT_DATA|SLARDAR/i.test(id)) continue;
+                const txt = el.textContent || '';
+                if (txt.length < 80 || !/itemList|aweme/i.test(txt)) continue;
+                try {
+                    truProcessFeedJsonPayload(JSON.parse(txt));
+                } catch (e) { /* ignore */ }
+            }
+        } catch (e) { /* ignore */ }
+    }
+
+    const _truXhrOpen = XMLHttpRequest.prototype.open;
+    const _truXhrSend = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.open = function (method, url, ...rest) {
+        try {
+            this._truReqUrl = typeof url === 'string' ? url : '';
+        } catch (e) {
+            this._truReqUrl = '';
+        }
+        return _truXhrOpen.apply(this, [method, url, ...rest]);
+    };
+    XMLHttpRequest.prototype.send = function (...sendArgs) {
+        this.addEventListener('load', function truOnXhrLoad() {
+            this.removeEventListener('load', truOnXhrLoad);
+            if (!truIsLikelyAwemeFeedApi(String(this._truReqUrl || ''))) return;
+            const rt = this.responseType;
+            if (rt && rt !== 'text' && rt !== '') return;
+            const raw = this.responseText;
+            if (!raw || typeof raw !== 'string') return;
+            const txt = raw.trim();
+            if (txt.charAt(0) !== '{') return;
+            try {
+                truProcessFeedJsonPayload(JSON.parse(txt));
+            } catch (e) { /* ignore non-JSON */ }
+        });
+        return _truXhrSend.apply(this, sendArgs);
+    };
+
+    /** Lấy chuỗi URL đầu tiên từ playAddr/downloadAddr kiểu n8n (string hoặc object UrlList/url_list). */
+    function truCoerceVideoUrlField(x) {
+        if (!x) return null;
+        if (typeof x === 'string' && /^https?:\/\//i.test(x)) return x;
+        if (typeof x === 'object') {
+            const arr = x.url_list || x.UrlList || x.URLList || x.urls;
+            if (Array.isArray(arr)) {
+                for (let i = 0; i < arr.length; i++) {
+                    const s = arr[i];
+                    if (typeof s === 'string' && /^https?:\/\//i.test(s)) return s;
+                }
+            }
+        }
+        return null;
+    }
+
+    /** Heuristic: không logo — download_addr hoặc play_addr, thử đổi playwm→play */
+    function truPreferCleanerVideoUrl(u) {
+        if (!u || typeof u !== 'string') return u;
+        let s = u;
+        if (/playwm/i.test(s)) {
+            try {
+                s = s.replace(/playwm/gi, 'play');
+            } catch (e) { /* ignore */ }
+        }
+        return s;
+    }
+
+    function truPickVideoDownloadUrl(item) {
+        const v = item?.video;
+        if (!v || typeof v !== 'object') return null;
+        const uDl = truCoerceVideoUrlField(v.download_addr)
+            || truCoerceVideoUrlField(v.downloadAddr);
+        if (uDl) return truPreferCleanerVideoUrl(uDl);
+        const uPl = truCoerceVideoUrlField(v.play_addr)
+            || truCoerceVideoUrlField(v.playAddr)
+            || truCoerceVideoUrlField(v.PlayAddr);
+        if (uPl) return truPreferCleanerVideoUrl(uPl);
+        const br = v.bit_rate || v.bitrateInfo || v.BitrateInfo;
+        if (Array.isArray(br) && br.length) {
+            const sorted = [...br].sort((a, b) => (
+                ((b.bit_rate || b.Bitrate || b.bitrate || 0)) - ((a.bit_rate || a.Bitrate || a.bitrate || 0))
+            ));
+            for (let i = 0; i < sorted.length; i++) {
+                const cand = sorted[i];
+                const u = truCoerceVideoUrlField(cand.play_addr || cand.PlayAddr || cand.playAddr);
+                if (u) return truPreferCleanerVideoUrl(u);
+            }
+        }
+        return null;
+    }
+
+    /** Một URL ảnh từ blob TikTok (display_image / image / url_list / uri…). */
+    function truCoerceImageUrlCandidate(x) {
+        if (!x) return null;
+        if (typeof x === 'string' && /^https?:\/\//i.test(x)) return x;
+        if (typeof x !== 'object') return null;
+        const lists = [x.url_list, x.UrlList, x.URLList, x.urls, x.urlList];
+        for (let j = 0; j < lists.length; j++) {
+            const arr = lists[j];
+            if (!Array.isArray(arr)) continue;
+            for (let k = 0; k < arr.length; k++) {
+                const s = arr[k];
+                if (typeof s === 'string' && /^https?:\/\//i.test(s)) return s;
+            }
+        }
+        const u = x.url || x.URL || x.uri || x.URI;
+        return (typeof u === 'string' && /^https?:\/\//i.test(u)) ? u : null;
+    }
+
+    function truExtractPhotoUrls(item) {
+        const ipi = item?.image_post_info || item?.imagePost || item?.ImagePost;
+        const imgs = ipi?.images;
+        if (!Array.isArray(imgs)) return [];
+        const urls = [];
+        for (let i = 0; i < imgs.length; i++) {
+            const im = imgs[i];
+            let u = truCoerceImageUrlCandidate(im?.display_image)
+                || truCoerceImageUrlCandidate(im?.DisplayImage)
+                || truCoerceImageUrlCandidate(im?.image)
+                || truCoerceImageUrlCandidate(im?.Image)
+                || truCoerceImageUrlCandidate(im);
+            if (u) urls.push(u);
+        }
+        return urls;
+    }
+
+    /** Fallback: ảnh đang hiển thị trên DOM (/photo/ hoặc khi JSON không có carousel). */
+    function truScrapePhotoUrlsFromDom() {
+        const candidates = [];
+        const reHost = /tiktokcdn|ibyteimg|byteimg|muscdn|akamaized|tiktok\.com\/obj|p16-sign|p77-sign/i;
+        document.querySelectorAll('img[src*="http"], img[srcset]').forEach((img) => {
+            const src = img.currentSrc || img.src;
+            if (!src || !/^https?:\/\//i.test(src)) return;
+            if (!reHost.test(src)) return;
+            if (/avatar|profile|100x100|50x50|32x32|24x24|emoji|static\/web/i.test(src)) return;
+            const w = img.naturalWidth || img.width || 0;
+            const h = img.naturalHeight || img.height || 0;
+            if (w < 140 && h < 140) return;
+            candidates.push({ src, area: Math.max(1, w) * Math.max(1, h) });
+        });
+        candidates.sort((a, b) => b.area - a.area);
+        const out = [];
+        const seen = new Set();
+        for (let i = 0; i < candidates.length; i++) {
+            const s = candidates[i].src;
+            if (seen.has(s)) continue;
+            seen.add(s);
+            out.push(s);
+            if (out.length >= 24) break;
+        }
+        return out;
+    }
+
+    /** Ưu tiên metadata; nếu trống, quét DOM khi đang /photo/… hoặc item là bài ảnh. */
+    function truMergePhotoDownloadUrls(item, path) {
+        const meta = item ? truExtractPhotoUrls(item) : [];
+        if (meta.length) return meta;
+        const p = path || '';
+        const onPhotoUrl = /\/photo\//i.test(p);
+        const photoItem = !!(item && (item.image_post_info || item.imagePost || item.ImagePost
+            || item.aweme_type === 150 || item.awemeType === 150));
+        if (!onPhotoUrl && !photoItem) return [];
+        return truScrapePhotoUrlsFromDom();
+    }
+
+    function truPhotoFilenameSuffix(url) {
+        const m = String(url || '').match(/\.(jpe?g|png|webp)(?:\?|$)/i);
+        if (m) {
+            const e = m[1].toLowerCase();
+            return e === 'jpeg' ? '.jpg' : `.${e}`;
+        }
+        return '.jpg';
+    }
+
+    /**
+     * Gắn id video TikTok đang chiếm màn hình: URL /video/… hoặc link gần trục dọc video.
+     */
+    function findAwemeIdNearViewportVideo(video) {
+        const path = window.location.pathname || '';
+        const fromPath = path.match(/\/video\/(\d{8,})\b/) || path.match(/\/photo\/(\d{8,})\b/);
+        if (fromPath && fromPath[1]) return fromPath[1];
+
+        if (!video || !video.getBoundingClientRect) return null;
+        const vr = video.getBoundingClientRect();
+        if (vr.width < 10 || vr.height < 10) return null;
+        const vc = (vr.top + vr.bottom) / 2;
+
+        let bestId = null;
+        let bestScore = 1e12;
+        document.querySelectorAll('a[href*="/video/"], a[href*="/photo/"]').forEach((a) => {
+            const m = String(a.href || '').match(/\/(?:video|photo)\/(\d{8,})\b/);
+            if (!m) return;
+            const r = a.getBoundingClientRect();
+            const cy = (r.top + r.bottom) / 2;
+            let score = Math.abs(cy - vc);
+            const overlap = r.bottom >= vr.top - 120 && r.top <= vr.bottom + 120;
+            if (!overlap) score += 8000;
+            if (score < bestScore) {
+                bestScore = score;
+                bestId = m[1];
+            }
+        });
+
+        try {
+            const src = video.currentSrc || video.src || '';
+            for (const k of Object.keys(window.truAwemeById)) {
+                const it = window.truAwemeById[k];
+                const play = truPickVideoDownloadUrl(it);
+                if (!play || !src) continue;
+                if (play.split('?')[0] === src.split('?')[0] || src.includes(play.slice(26, 80))) {
+                    bestId = k;
+                    break;
+                }
+            }
+        } catch (e) { /* ignore */ }
+
+        return bestId;
+    }
+
+    let _truFocusTupleCache = null;
+    let _truFocusTupleAt = 0;
+    const TRU_FOCUS_TUPLE_MS = 350;
+    /** `opts.force` — khi bấm tải cần metadata chính xác, bỏ cache */
+    function getTruFocusedAweme(opts) {
+        const force = !!(opts && opts.force);
+        const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
+        if (!force && _truFocusTupleCache && (now - _truFocusTupleAt) < TRU_FOCUS_TUPLE_MS) {
+            const v = _truFocusTupleCache.video;
+            if (!v || (typeof document !== 'undefined' && document.contains(v))) {
+                return _truFocusTupleCache;
+            }
+        }
+        const video = findBestFeedVideo(force);
+        const id = findAwemeIdNearViewportVideo(video);
+        const item = id ? window.truAwemeById[id] : null;
+        const r = { video, awemeId: id, item };
+        _truFocusTupleCache = r;
+        _truFocusTupleAt = now;
+        return r;
+    }
+
+    let _truLastHydrDetailMs = 0;
+    /**
+     * Cùng luồng n8n: parse __UNIVERSAL_DATA_FOR_REHYDRATION__
+     * → __DEFAULT_SCOPE__['webapp.video-detail'].itemInfo.itemStruct → ingest cache.
+     */
+    function truTryIngestHydrationVideoDetail() {
+        const now = Date.now();
+        if (now - _truLastHydrDetailMs < 700) return;
+        _truLastHydrDetailMs = now;
+        let parsed = null;
+        try {
+            const el = document.getElementById('__UNIVERSAL_DATA_FOR_REHYDRATION__');
+            const raw = el && el.textContent ? el.textContent.trim() : '';
+            if (raw && raw.charAt(0) === '{') parsed = JSON.parse(raw);
+        } catch (e) {
+            return;
+        }
+        if (!parsed || typeof parsed !== 'object') {
+            try {
+                const w = window.__UNIVERSAL_DATA_FOR_REHYDRATION__;
+                if (w && typeof w === 'object') parsed = w;
+            } catch (e2) { /* ignore */ }
+        }
+        if (!parsed || typeof parsed !== 'object') return;
+
+        const scope = parsed.__DEFAULT_SCOPE__ || parsed.defaultScope;
+        if (!scope || typeof scope !== 'object') return;
+        const detail = scope['webapp.video-detail']
+            || scope['webapp.video_detail']
+            || scope['webapp.photo-detail']
+            || scope['webapp.photo_detail'];
+        if (!detail || typeof detail !== 'object') return;
+        const itemStruct = detail.itemInfo?.itemStruct
+            || detail.item_info?.itemStruct;
+        if (!itemStruct || typeof itemStruct !== 'object') return;
+        const nid = itemStruct.aweme_id || itemStruct.awemeId || itemStruct.id;
+        if (nid == null || String(nid).trim() === '') return;
+
+        const hasVid = !!(itemStruct.video && typeof itemStruct.video === 'object');
+        const ipi = itemStruct.image_post_info || itemStruct.imagePost || itemStruct.ImagePost;
+        const hasPhotos = !!(ipi && typeof ipi === 'object'
+            && Array.isArray(ipi.images) && ipi.images.length > 0);
+        if (!hasVid && !hasPhotos) return;
+
+        truIngestAwemeItems([itemStruct]);
+    }
+
+    function truFormatCount(n) {
+        if (n == null || n === '' || Number.isNaN(Number(n))) return '—';
+        const x = Number(n);
+        if (x >= 1e9) return `${(x / 1e9).toFixed(1)}B`;
+        if (x >= 1e6) return `${(x / 1e6).toFixed(1)}M`;
+        if (x >= 1e3) return `${(x / 1e3).toFixed(1)}K`;
+        return `${x}`;
+    }
+
+    async function truBlobDownload(fetchUrl, filename, statusEl, okLabel, errPrefix) {
+        if (!fetchUrl) {
+            if (statusEl) statusEl.textContent = errPrefix + 'Không có URL.';
+            return false;
+        }
+        if (statusEl) statusEl.textContent = '⏳ Đang lấy tệp…';
+        try {
+            const isBlob = /^blob:/i.test(fetchUrl);
+            const isTikTokish = /tiktok|byteoversea|akamaized|ttcdn|muscdn|ibyteimg/i.test(fetchUrl);
+            const init = {
+                credentials: isBlob ? 'same-origin' : 'include',
+                mode: 'cors',
+                referrer: typeof location !== 'undefined' ? location.href : undefined,
+            };
+            if (!isBlob && isTikTokish) {
+                init.referrer = 'https://www.tiktok.com/';
+            }
+            const r = await originalFetch(fetchUrl, init);
+            if (!r.ok) throw new Error(String(r.status));
+            const blob = await r.blob();
+            const blobUrl = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = blobUrl;
+            a.download = filename;
+            a.rel = 'noopener';
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            setTimeout(() => URL.revokeObjectURL(blobUrl), 9000);
+            if (statusEl) statusEl.textContent = okLabel;
+            return true;
+        } catch (e) {
+            if (statusEl) statusEl.textContent = errPrefix + 'Mở tab mới tải thử.';
+            try {
+                if (!/^blob:/i.test(fetchUrl)) window.open(fetchUrl, '_blank', 'noopener,noreferrer');
+            } catch (e2) { }
+            return false;
+        }
+    }
+
+    function refreshTruViewerPanel() {
+        truTryIngestHydrationVideoDetail();
+        truHarvestEmbeddedPageState();
+
+        const { awemeId, item, video } = getTruFocusedAweme();
+        const sid = document.getElementById('tru-viewer-id');
+        const dg = document.getElementById('tru-stat-digg');
+        const cm = document.getElementById('tru-stat-comment');
+        const sh = document.getElementById('tru-stat-share');
+        const pl = document.getElementById('tru-stat-play');
+        if (sid) {
+            sid.textContent = item
+                ? `ID · ${awemeId} · @${item.author?.uniqueId || '—'}`
+                : awemeId
+                    ? `ID · ${awemeId} (chưa có metadata — F5 hoặc đợi trang tải xong; ảnh dùng nút Tải ảnh)`
+                    : video
+                        ? 'Vuốt/đặt clip giữa màn — chưa xác định ID'
+                        : /\/photo\//i.test(window.location.pathname || '')
+                            ? 'Trang ảnh — đợi metadata hoặc F5'
+                            : 'Không có video trên trang';
+        }
+
+        const cacheN = Object.keys(window.truAwemeById).length;
+        const cacheEl = document.getElementById('tru-cache-count');
+        if (cacheEl) {
+            const onDetail = /\/video\/|\/photo\//i.test(window.location.pathname || '');
+            cacheEl.textContent = cacheN > 0
+                ? `Đã bắt metadata: ${cacheN} clip (API + hydration trang chi tiết nếu có)`
+                : (onDetail
+                    ? 'Đang chờ hydration __UNIVERSAL_DATA… — hoặc F5 trang video/ảnh'
+                    : 'Chưa thấy gói item_list — vuốt FYP, hoặc mở /video/… hoặc /photo/…');
+        }
+
+        let digg = '—'; let comment = '—'; let share = '—'; let play = '—';
+        const statObj = item && (item.stats || item.statistics);
+        if (statObj && typeof statObj === 'object') {
+            digg = truFormatCount(statObj.diggCount ?? statObj.digg_count);
+            comment = truFormatCount(statObj.commentCount ?? statObj.comment_count);
+            share = truFormatCount(statObj.shareCount ?? statObj.share_count);
+            play = truFormatCount(statObj.playCount ?? statObj.play_count);
+        }
+        if (dg) dg.innerText = digg;
+        if (cm) cm.innerText = comment;
+        if (sh) sh.innerText = share;
+        if (pl) pl.innerText = play;
+
+        const ph = document.getElementById('tru-btn-dl-photos');
+        const pathname = window.location.pathname || '';
+        const photoUrls = truMergePhotoDownloadUrls(item, pathname);
+        const showPhotoBtn = photoUrls.length > 0 || /\/photo\//i.test(pathname);
+        if (ph) {
+            ph.style.display = showPhotoBtn ? 'block' : 'none';
+            ph.disabled = photoUrls.length === 0;
+        }
+
+        const vbtn = document.getElementById('tru-btn-dl-video');
+        if (vbtn) {
+            const hasMeta = !!(item && truPickVideoDownloadUrl(item));
+            const vs = video && (video.currentSrc || video.src || '');
+            const stream = !!(vs && (vs.startsWith('http') || /^blob:/i.test(vs)));
+            vbtn.disabled = !hasMeta && !stream;
+        }
+    }
+
+    function startTiktokMusicPulse() {
+        if (window._truMusicPulseStarted) return;
+        window._truMusicPulseStarted = true;
+
+        const FFT = 512;
+        let audioCtx = null;
+        let analyser = null;
+        /** Chrome: không tạo / nối Web Audio / resume context cho đến khi có cử chỉ người dùng */
+        let truWebAudioUserGestured = false;
+        if (!window._truWebAudioGestureInstalled) {
+            window._truWebAudioGestureInstalled = true;
+            const types = ['pointerdown', 'touchstart', 'keydown'];
+            function onFirstUserGestureAudio() {
+                truWebAudioUserGestured = true;
+                try {
+                    if (audioCtx && audioCtx.state === 'suspended') {
+                        audioCtx.resume().catch(() => { });
+                    }
+                } catch (e) { /* ignore */ }
+                for (let i = 0; i < types.length; i++) {
+                    document.removeEventListener(types[i], onFirstUserGestureAudio, true);
+                }
+            }
+            for (let i = 0; i < types.length; i++) {
+                document.addEventListener(types[i], onFirstUserGestureAudio, { capture: true, passive: true });
+            }
+        }
+        /** Nguồn Web Audio — MediaElementSource hoặc MediaStreamSource */
+        let audioInputNode = null;
+        /** Chỉ dùng với đường MES — cần nối tới destination để vẫn nghe được */
+        let audioOutputGain = null;
+        let lastVideo = null;
+        /** Khi không tap được âm thanh — hạn chế spam Web Audio */
+        let lastTapFailTs = 0;
+        let lastTapFailVid = null;
+        /** Chuẩn hoá nhịp: mượt nhưng vẫn bám transient */
+        let displaySmooth = 1;
+        /** Bao làm chậm để tính “nhảy” (onset / kick) */
+        let slowSpectrumEnv = 0;
+        /** Giảm tải CPU: phân tích/vẽ sóng ~30fps; filter vẫn mượt nhờ nội suy */
+        let lastDriveSample = 0;
+        let lastSampleAt = 0;
+        /** Tránh gán `element.style.filter` mỗi frame khi khác biệt không đáng kể — giảm reflow/layout */
+        let lastPulseFilterKey = '';
+        const AUDIO_SAMPLE_INTERVAL_MS = 34;
+
+        function resetEnvelope() {
+            slowSpectrumEnv = 0;
+            beatPeak = 0;
+        }
+
+        function resetBeatDynamics() {
+            resetEnvelope();
+            displaySmooth = 1;
+        }
+
+        function disconnectGraph() {
+            try {
+                if (audioOutputGain) {
+                    audioOutputGain.disconnect();
+                    audioOutputGain = null;
+                }
+                if (analyser) {
+                    analyser.disconnect();
+                    analyser = null;
+                }
+                if (audioInputNode) {
+                    audioInputNode.disconnect();
+                    audioInputNode = null;
+                }
+            } catch (e) { }
+            resetEnvelope();
+        }
+
+        function createAnalyserNode() {
+            const a = audioCtx.createAnalyser();
+            a.fftSize = FFT;
+            a.smoothingTimeConstant = 0.32;
+            a.minDecibels = -85;
+            a.maxDecibels = -18;
+            return a;
+        }
+
+        /**
+         * Thứ tự quan trọng cho âm thanh:
+         * ① srcObject / captureStream — chỉ tap bản sao stream, KHÔNG cắt loa video.
+         * ② createMediaElementSource — can thiệp pipeline (chỉ dùng khi ① thất bại).
+         */
+        function attachToVideo(video) {
+            if (!video) return;
+            if (!truWebAudioUserGestured) return;
+            if (video === lastVideo && analyser) return;
+            const backoff = Date.now() - lastTapFailTs < 900;
+            if (!analyser && backoff && lastTapFailVid === video) return;
+
+            disconnectGraph();
+            audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+            if (audioCtx.state === 'suspended') audioCtx.resume().catch(() => { });
+
+            analyser = createAnalyserNode();
+
+            const tryMediaElementTap = () => {
+                try {
+                    const mes = audioCtx.createMediaElementSource(video);
+                    const g = audioCtx.createGain();
+                    g.gain.value = 1;
+                    mes.connect(analyser);
+                    analyser.connect(g);
+                    g.connect(audioCtx.destination);
+                    audioInputNode = mes;
+                    audioOutputGain = g;
+                    return true;
+                } catch (e) {
+                    return false;
+                }
+            };
+
+            const tryStreamTap = (stream) => {
+                if (!stream || typeof stream.getAudioTracks !== 'function' || !stream.getAudioTracks().length) {
+                    return false;
+                }
+                try {
+                    const mss = audioCtx.createMediaStreamSource(stream);
+                    mss.connect(analyser);
+                    audioInputNode = mss;
+                    audioOutputGain = null;
+                    return true;
+                } catch (e) {
+                    return false;
+                }
+            };
+
+            try {
+                const so = video.srcObject;
+                if (so instanceof MediaStream && tryStreamTap(so)) {
+                    lastTapFailVid = null;
+                    lastTapFailTs = 0;
+                    lastVideo = video;
+                    return;
+                }
+            } catch (e) { }
+
+            if (typeof video.captureStream === 'function') {
+                try {
+                    const cap = video.captureStream();
+                    if (tryStreamTap(cap)) {
+                        lastTapFailVid = null;
+                        lastTapFailTs = 0;
+                        lastVideo = video;
+                        return;
+                    }
+                } catch (e) { }
+            }
+
+            if (tryMediaElementTap()) {
+                lastTapFailVid = null;
+                lastTapFailTs = 0;
+                lastVideo = video;
+                return;
+            }
+
+            disconnectGraph();
+            lastTapFailVid = video;
+            lastTapFailTs = Date.now();
+            lastVideo = null;
+        }
+
+        const freqBuf = new Uint8Array(FFT / 2);
+        let timeWaveBuf = null;
+        const FFT_BARS = 24;
+
+        /**
+         * Năng lượng dải tần (kick ~40–220 Hz, xung low-mid ~220–900 Hz).
+         * Thêm spectral-flux nhẹ để nhấn vào đúng lúc trống/snare đập.
+         */
+        function computeBeatDrive() {
+            if (!analyser || !audioCtx) return 0;
+
+            analyser.getByteFrequencyData(freqBuf);
+            const sr = audioCtx.sampleRate;
+            const hz = sr / FFT;
+            const n = analyser.frequencyBinCount;
+
+            const band = (loHz, hiHz) => {
+                let a = Math.max(1, Math.floor(loHz / hz));
+                let b = Math.min(n - 1, Math.ceil(hiHz / hz));
+                if (b < a) return { avg: 0, mx: 0 };
+                let sum = 0;
+                let mx = 0;
+                for (let i = a; i <= b; i++) {
+                    const v = freqBuf[i];
+                    sum += v;
+                    if (v > mx) mx = v;
+                }
+                const cnt = b - a + 1;
+                return { avg: (sum / cnt) / 255, mx: mx / 255 };
+            };
+
+            const kick = band(45, 220);
+            const punch = band(220, 950);
+            const air = band(2000, 6500);
+
+            const body = kick.avg * 0.55 + punch.avg * 0.32 + air.avg * 0.13;
+            const spike = kick.mx * 0.62 + punch.mx * 0.38;
+            let instant = body * 0.42 + spike * 0.58;
+
+            slowSpectrumEnv = slowSpectrumEnv * 0.90 + instant * 0.10;
+            const onset = Math.max(0, instant - slowSpectrumEnv * 1.08);
+            instant = Math.min(1, instant + onset * 2.1);
+
+            if (instant > beatPeak) beatPeak = instant;
+            else beatPeak *= 0.87;
+
+            return Math.min(1, beatPeak * 0.92 + onset * 0.45);
+        }
+
+        /** Vẽ oscilloscope + thanh FFT lên canvas (mini icon + panel) */
+        function paintMusicWaves(timeBuf, specBuf, hasAnalyser, beatNorm) {
+            const mini = document.getElementById('tru-mini-wave-canvas');
+            const wrap = document.getElementById('tru-panel-wave-wrap');
+            const panel = document.getElementById('tru-panel-wave-canvas');
+
+            function clearCnvs(cvs) {
+                if (!cvs) return;
+                const ctx = cvs.getContext('2d');
+                if (ctx && cvs.width) ctx.clearRect(0, 0, cvs.width, cvs.height);
+            }
+
+            if (!hasAnalyser || !timeBuf || timeBuf.length < 8 || !mini) {
+                if (wrap) wrap.style.display = 'none';
+                clearCnvs(panel);
+                clearCnvs(mini);
+                return;
+            }
+
+            if (wrap && panel) {
+                const uiRoot = document.getElementById('tiktok-repost-ui');
+                const panelOpen = !!(uiRoot && uiRoot.style.display !== 'none');
+                wrap.style.display = panelOpen ? 'block' : 'none';
+                if (!panelOpen) clearCnvs(panel);
+            }
+
+            const drawOne = (canvas, isMini) => {
+                if (!canvas || !canvas.getContext) return;
+                const dpr = Math.min(2.5, window.devicePixelRatio || 1);
+                const rectW = canvas.clientWidth || (isMini ? 50 : 280);
+                const rectH = canvas.clientHeight || (isMini ? 22 : 38);
+                const tw = Math.max(48, Math.floor(rectW * dpr));
+                const th = Math.max(12, Math.floor(rectH * dpr));
+                if (canvas.width !== tw || canvas.height !== th) {
+                    canvas.width = tw;
+                    canvas.height = th;
+                }
+                const ctx = canvas.getContext('2d', { alpha: true, desynchronized: true })
+                    || canvas.getContext('2d');
+                if (!ctx) return;
+                const n = timeBuf.length;
+
+                ctx.clearRect(0, 0, tw, th);
+                ctx.fillStyle = isMini ? 'rgba(11,13,26,0.55)' : 'rgba(13,17,38,0.62)';
+                ctx.fillRect(0, 0, tw, th);
+
+                const midY = th * 0.42;
+                const amp = th * (isMini ? 0.28 : 0.34) * (0.72 + beatNorm * 0.58);
+                const step = Math.max(1, Math.floor(n / (tw / (dpr * 1.85))));
+
+                const gx = ctx.createLinearGradient(0, 0, tw, 0);
+                gx.addColorStop(0, `rgba(37,244,238,${0.38 + beatNorm * 0.45})`);
+                gx.addColorStop(0.5, `rgba(254,44,85,${0.55 + beatNorm * 0.32})`);
+                gx.addColorStop(1, `rgba(167,139,250,${0.4 + beatNorm * 0.38})`);
+
+                ctx.beginPath();
+                let px = -1;
+                for (let i = 0; i < n; i += step) {
+                    const x = (i / Math.max(1, n - 1)) * tw;
+                    const v = (timeBuf[i] - 128) / 128;
+                    const y = midY + v * amp;
+                    if (px < 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+                    px = x;
+                }
+                ctx.strokeStyle = gx;
+                ctx.lineWidth = Math.max(1.1, dpr * (isMini ? 1.05 : 1.28));
+                ctx.lineJoin = 'round';
+                ctx.stroke();
+
+                ctx.beginPath();
+                ctx.moveTo(0, th);
+                for (let i = 0; i < n; i += step) {
+                    const x = (i / Math.max(1, n - 1)) * tw;
+                    const v = (timeBuf[i] - 128) / 128;
+                    const y = midY + v * amp;
+                    ctx.lineTo(x, y);
+                }
+                ctx.lineTo(tw, th);
+                ctx.closePath();
+                ctx.fillStyle = `rgba(254,44,85,${0.07 + beatNorm * 0.15})`;
+                ctx.fill();
+
+                if (specBuf && specBuf.length > FFT_BARS + 16) {
+                    const bars = FFT_BARS;
+                    const pad = Math.max(1.5, dpr);
+                    const totalW = tw - pad * 2;
+                    const barGap = pad * 0.35;
+                    const bw = Math.max(1.2, (totalW - barGap * (bars - 1)) / bars);
+                    const bhMax = Math.max(3, (th - midY - pad * 2) * 0.95);
+                    let x0 = pad;
+                    const loIx = Math.max(4, Math.floor(specBuf.length * 0.02));
+
+                    const barGradTop = '#25F4EE';
+                    const barGradBot = '#FE2C55';
+
+                    for (let b = 0; b < bars; b++) {
+                        const r0 = loIx + Math.floor((specBuf.length - loIx - 8) * b / bars);
+                        const r1 = loIx + Math.floor((specBuf.length - loIx - 8) * (b + 0.92) / bars);
+                        let peak = 0;
+                        for (let j = r0; j <= r1 && j < specBuf.length; j++) if (specBuf[j] > peak) peak = specBuf[j];
+
+                        let hPx = bhMax * Math.pow(peak / 255, 0.75) * (0.55 + beatNorm * 0.45);
+
+                        ctx.fillStyle = (() => {
+                            const g = ctx.createLinearGradient(0, th - pad - hPx, 0, th - pad);
+                            g.addColorStop(0, barGradTop);
+                            g.addColorStop(1, barGradBot);
+                            return g;
+                        })();
+                        const fy = Math.max(midY + pad * 0.75, th - pad - hPx);
+                        const fh = Math.min(hPx, Math.max(0, th - pad - fy));
+
+                        ctx.fillRect(x0, fy, bw, fh);
+                        x0 += bw + barGap;
+                    }
+                }
+            };
+
+            drawOne(mini, true);
+            const uiRootDraw = document.getElementById('tiktok-repost-ui');
+            if (panel && uiRootDraw && uiRootDraw.style.display !== 'none') {
+                drawOne(panel, false);
+            }
+        }
+
+        function tick() {
+            const ui = document.getElementById('tiktok-repost-ui');
+            const icon = document.getElementById('tiktok-minimized-icon');
+
+            const v = findBestFeedVideo(false);
+            if (v && !v.paused) {
+                attachToVideo(v);
+            } else if (v && v.paused && lastVideo === v) {
+                beatPeak *= 0.9;
+            }
+
+            const nowMs = performance.now();
+            let didAudioSample = false;
+            if (analyser && audioCtx) {
+                if (nowMs - lastSampleAt >= AUDIO_SAMPLE_INTERVAL_MS) {
+                    lastSampleAt = nowMs;
+                    didAudioSample = true;
+                    const d = computeBeatDrive();
+                    if (!timeWaveBuf || timeWaveBuf.length !== analyser.fftSize) {
+                        timeWaveBuf = new Uint8Array(analyser.fftSize);
+                    }
+                    analyser.getByteTimeDomainData(timeWaveBuf);
+                    lastDriveSample = d;
+                }
+            } else {
+                lastDriveSample *= 0.88;
+                if (lastDriveSample < 0.02) lastDriveSample = 0;
+                didAudioSample = true;
+            }
+
+            const drive = lastDriveSample;
+
+            const targetPulse = 1 + Math.min(drive * 0.26, 0.24);
+            const up = targetPulse > displaySmooth ? 0.62 : 0.20;
+            displaySmooth += (targetPulse - displaySmooth) * up;
+
+            const bright = 0.90 + Math.min(drive * 0.55, 0.18);
+            const glow = 5 + drive * 52;
+            const pulseKey = `${bright.toFixed(2)}|${glow.toFixed(1)}`;
+            if (pulseKey !== lastPulseFilterKey) {
+                lastPulseFilterKey = pulseKey;
+                const apply = (el) => {
+                    if (!el || el.style.display === 'none') return;
+                    el.style.filter = `brightness(${bright.toFixed(3)}) drop-shadow(0 0 ${glow.toFixed(1)}px rgba(254,44,85,0.58))`;
+                };
+
+                if (ui && ui.style.display !== 'none') apply(ui);
+                if (icon && icon.style.display !== 'none') apply(icon);
+            }
+
+            if (didAudioSample) {
+                paintMusicWaves(analyser && timeWaveBuf ? timeWaveBuf : null,
+                    freqBuf,
+                    !!analyser,
+                    Math.min(1, drive));
+            }
+
+            requestAnimationFrame(tick);
+        }
+        requestAnimationFrame(tick);
+    }
+
     function getUserInfo() {
         const FALLBACK = 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0icmdiYSgyNTUsMjU1LDI1NSwwLjI0KSI+PGNpcmNsZSBjeD0iMTIiIGN5PSI4IiByPSI0Ii8+PHBhdGggZD0iTTEyLDE0Yy02LjEsMC0xMiw0LTEyLDR2MmgyNHYtMkMyNCwxOCwxOC4xLDE0LDEyLDE0eiIvPjwvc3ZnPg==';
-        const avatarEl = document.querySelector('[data-e2e="profile-icon"] img') || 
-                         document.querySelector('[data-e2e="user-avatar"] img') ||
-                         document.querySelector('.TUXButton-content img') ||
-                         document.querySelector('img[class*="Avatar"]');
-        
-        const editBtn = document.querySelector('[data-e2e="edit-profile-entrance"]') || 
-                        document.querySelector('button[class*="Edit"]');
-        
+        const navAvatar = document.querySelector('[data-e2e="profile-icon"] img') ||
+            document.querySelector('a[href*="/@"] img[src*="tiktokcdn"]');
+        const editBtn = document.querySelector('[data-e2e="edit-profile-entrance"]') ||
+            document.querySelector('button[class*="Edit"]');
+        const pageKind = getPageKind();
+        const cached = getCachedUserProfile();
+        const hasProfileCache = !!cached;
+
         const sel = {
             nickname: '[data-e2e="user-title"], h1[class*="Nickname"]',
             username: '[data-e2e="user-subtitle"], h2[class*="UniqueId"]',
             stats: '[data-e2e$="-count"], [class*="StrongStatCount"]'
         };
-        const stats = Array.from(document.querySelectorAll(sel.stats)).map(el => el.innerText);
-        
-        const info = {
-            loggedIn: !!avatarEl || !!editBtn,
-            isOwnProfile: !!editBtn,
-            avatar: (avatarEl && avatarEl.src && avatarEl.src.startsWith('http')) ? avatarEl.src : FALLBACK,
-            nickname: document.querySelector(sel.nickname) ? document.querySelector(sel.nickname).innerText : 'Người dùng TikTok',
-            username: document.querySelector(sel.username) ? document.querySelector(sel.username).innerText : '@unknown',
-            following: stats[0] || '0',
-            followers: stats[1] || '0',
-            likes: stats[2] || '0'
-        };
 
-        if (info.isOwnProfile && !localStorage.getItem('tiktok_extension_verified_user')) {
-            localStorage.setItem('tiktok_extension_verified_user', JSON.stringify(info));
+        const loggedIn = !!(navAvatar && navAvatar.src && navAvatar.src.startsWith('http')) || !!editBtn;
+
+        if (pageKind === 'own') {
+            const profileAvatar = document.querySelector('[data-e2e="user-avatar"] img') ||
+                document.querySelector('img[class*="Avatar"]');
+            const nickEl = document.querySelector(sel.nickname);
+            const userEl = document.querySelector(sel.username);
+            const stats = Array.from(document.querySelectorAll(sel.stats)).map(el => el.innerText);
+            const info = {
+                loggedIn: true,
+                pageKind: 'own',
+                hasProfileCache,
+                needsProfileSync: false,
+                isOwnProfile: true,
+                canBulkActions: true,
+                avatar: (profileAvatar && profileAvatar.src && profileAvatar.src.startsWith('http')) ? profileAvatar.src : ((navAvatar && navAvatar.src) || FALLBACK),
+                nickname: nickEl ? nickEl.innerText.trim() : 'Người dùng TikTok',
+                username: userEl ? userEl.innerText.trim() : '@unknown',
+                following: stats[0] || '0',
+                followers: stats[1] || '0',
+                likes: stats[2] || '0'
+            };
+            if (!localStorage.getItem(TRU_CACHE_KEY)) {
+                localStorage.setItem(TRU_CACHE_KEY, JSON.stringify(info));
+            }
+            return info;
         }
 
-        return info;
+        if (pageKind === 'other') {
+            const profileAvatar = document.querySelector('[data-e2e="user-avatar"] img') ||
+                document.querySelector('img[class*="Avatar"]');
+            const nickEl = document.querySelector(sel.nickname);
+            const userEl = document.querySelector(sel.username);
+            const stats = Array.from(document.querySelectorAll(sel.stats)).map(el => el.innerText);
+            return {
+                loggedIn: !!(profileAvatar || nickEl || navAvatar || editBtn),
+                pageKind: 'other',
+                hasProfileCache,
+                needsProfileSync: false,
+                isOwnProfile: false,
+                canBulkActions: false,
+                avatar: (profileAvatar && profileAvatar.src && profileAvatar.src.startsWith('http')) ? profileAvatar.src : FALLBACK,
+                nickname: nickEl ? nickEl.innerText.trim() : 'Người dùng TikTok',
+                username: userEl ? userEl.innerText.trim() : '@unknown',
+                following: stats[0] || '—',
+                followers: stats[1] || '—',
+                likes: stats[2] || '—'
+            };
+        }
+
+        const fallbackNick = cached?.nickname || '—';
+        const fallbackUser = cached?.username || '@—';
+        const needsProfileSync = loggedIn && !hasProfileCache;
+        return {
+            loggedIn,
+            pageKind: 'feed',
+            hasProfileCache,
+            needsProfileSync,
+            isOwnProfile: false,
+            canBulkActions: loggedIn && hasProfileCache,
+            avatar: (cached?.avatar && String(cached.avatar).startsWith('http')) ? cached.avatar
+                : ((navAvatar && navAvatar.src && navAvatar.src.startsWith('http')) ? navAvatar.src : FALLBACK),
+            nickname: hasProfileCache ? fallbackNick : (loggedIn ? 'Chưa đồng bộ hồ sơ' : '—'),
+            username: hasProfileCache ? fallbackUser : (loggedIn ? 'Vào trang của bạn 1 lần' : '—'),
+            following: hasProfileCache ? (cached.following || '—') : '—',
+            followers: hasProfileCache ? (cached.followers || '—') : '—',
+            likes: hasProfileCache ? (cached.likes || '—') : '—'
+        };
     }
 
     async function signF(url) {
@@ -109,8 +1149,331 @@ function () {
 
     window.unfavoriteTiktokVideo = (id, el) => { if (el) el.innerText = "⏳"; window.open(`https://www.tiktok.com/@user/video/${id}?autounfav=1`, '_blank'); return true; };
 
+    function clampDelaySec(v, loS, hiS) {
+        if (v === '' || v == null) return null;
+        const n = parseFloat(String(v).trim().replace(',', '.'));
+        if (!Number.isFinite(n)) return null;
+        return Math.min(hiS, Math.max(loS, n));
+    }
+
+    function formatDelaySec(sec) {
+        if (!Number.isFinite(sec)) return '1.2';
+        return (Math.round(sec * 1000) / 1000).toFixed(3).replace(/\.?0+$/, '');
+    }
+
+    function msToDisplayedSec(ms) {
+        const s = (Number(ms) || 1200) / 1000;
+        return Math.round(s * 1000) / 1000;
+    }
+
+    /** Parse giây từ input UI → ms (clamp theo hi ms). */
+    function parseSecStrToMs(v, loMs, hiMs) {
+        const sec = clampDelaySec(v, loMs / 1000, hiMs / 1000);
+        return sec != null ? Math.round(sec * 1000) : null;
+    }
+
+    function getProcessingDelayMs() {
+        const slider = document.getElementById('delay-range');
+        const num = document.getElementById('delay-general-num');
+        let v = parseSecStrToMs(num && num.value !== '' ? num.value : null, 200, 60000);
+        if (v == null && slider) v = parseSecStrToMs(slider.value, 200, 60000);
+        return v != null ? v : 1200;
+    }
+
+    function getFollowingUnfollowDelayMs() {
+        const ck = document.getElementById('delay-fl-random');
+        if (ck && ck.checked) {
+            const minEl = document.getElementById('delay-fl-min');
+            const maxEl = document.getElementById('delay-fl-max');
+            let lo = parseSecStrToMs(minEl?.value, 200, 30000) ?? 800;
+            let hi = parseSecStrToMs(maxEl?.value, 200, 30000) ?? 2500;
+            if (hi < lo) { const t = lo; lo = hi; hi = t; }
+            return Math.floor(lo + Math.random() * (hi - lo + 1));
+        }
+        const slider = document.getElementById('delay-range-fl');
+        const num = document.getElementById('delay-fl-num');
+        let v = parseSecStrToMs(num && num.value !== '' ? num.value : null, 300, 30000);
+        if (v == null && slider) v = parseSecStrToMs(slider.value, 300, 30000);
+        if (v == null) {
+            const fallback = document.getElementById('delay-range');
+            v = parseSecStrToMs(fallback?.value, 300, 30000) ?? 1200;
+        }
+        return v;
+    }
+
+    function isBannedFriendFollowButton(btn) {
+        const t = (btn.innerText || '').trim();
+        const aria = (btn.getAttribute('aria-label') || '');
+        return /Bạn bè/i.test(t) || /Bạn bè/i.test(aria);
+    }
+
+    function isDaFollowUnfollowDomButton(btn) {
+        if (!btn || btn.getAttribute('data-e2e') !== 'follow-button') return false;
+        if (isBannedFriendFollowButton(btn)) return false;
+        const t = (btn.innerText || '').trim();
+        const aria = (btn.getAttribute('aria-label') || '');
+        if (/đã\s*follow/i.test(t) || /đã\s*follow/i.test(aria)) return true;
+        if (t === 'Following' || /\bFollowing\b/i.test(aria)) return true;
+        return false;
+    }
+
+    function findDaFollowButtonForUniqueId(uniqueIdRaw) {
+        const uid = (uniqueIdRaw || '').replace(/^@/, '').trim().toLowerCase();
+        if (!uid) return null;
+        for (const btn of document.querySelectorAll('button[data-e2e="follow-button"]')) {
+            if (!isDaFollowUnfollowDomButton(btn)) continue;
+            let p = btn;
+            for (let i = 0; i < 16 && p; i++) {
+                const low = (p.textContent || '').toLowerCase();
+                if (low.includes('@' + uid)) return btn;
+                p = p.parentElement;
+            }
+        }
+        return null;
+    }
+
+    async function unfollowTiktokUserDom(uniqueId, el) {
+        const btn = findDaFollowButtonForUniqueId(uniqueId);
+        if (!btn) {
+            if (el) { el.innerText = "❌"; el.disabled = false; }
+            return false;
+        }
+        if (el) { el.innerText = "⏳"; el.disabled = true; }
+        btn.click();
+        await new Promise(r => setTimeout(r, getFollowingUnfollowDelayMs()));
+        if (el) { el.innerText = "✅"; el.style.background = "rgba(40,167,69,0.2)"; }
+        return true;
+    }
+
+    window.unfollowTiktokUserDom = unfollowTiktokUserDom;
+
+    async function bulkUnfollowDomLoop(statusEl) {
+        const maxLoops = 50000;
+        let n = 0;
+        for (let i = 0; i < maxLoops; i++) {
+            const candidates = findDaFollowButtonsInFollowingModal();
+            const next = candidates[0];
+            if (!next) break;
+            n++;
+            const delay = getFollowingUnfollowDelayMs();
+            const line = `⏳ HUỶ ${n} (delay ~${ formatDelaySec((delay || 0) / 1000) }s)`;
+            if (statusEl) statusEl.innerText = line;
+            updateFlBulkUI(`④ Đang hủy follow…`, n);
+            try {
+                next.scrollIntoView({ block: 'center', behavior: 'auto' });
+            } catch (e) { next.scrollIntoView(true); }
+            await new Promise(r => setTimeout(r, 420));
+            next.click();
+            await new Promise(r => setTimeout(r, delay));
+        }
+        return n;
+    }
+
+    window.bulkUnfollowDomLoop = bulkUnfollowDomLoop;
+
+    window.tiktokLastFollowingUrlObj = null;
+
+    function dedupeFollowingPush(arr) {
+        const seen = new Set(window.allFollowing.map(entry => {
+            const usr = entry.user || entry;
+            return usr.secUid || usr.sec_uid || usr.id || '';
+        }).filter(Boolean));
+        arr.forEach(entry => {
+            const usr = entry.user || entry;
+            const id = usr.secUid || usr.sec_uid || usr.id;
+            if (id && !seen.has(id)) { seen.add(id); window.allFollowing.push(entry); }
+        });
+    }
+
+    function safeUnfBtnId(sec) { return 'btn-unf-' + String(sec).replace(/\W/g, '_'); }
+
+    function openFollowingStatsClick() {
+        const byE2e = document.querySelector('[data-e2e="following-count"]');
+        const target = (byE2e && (byE2e.closest('a[href]') || byE2e.closest('[role="button"]') || byE2e.closest('div[class*="DivNumber"]'))) || byE2e;
+        if (target) target.click();
+    }
+
+    function findDaFollowButtonsInFollowingModal() {
+        const sc = findTiktokFollowingListScrollRoot();
+        if (!sc) return [];
+        let list = Array.from(sc.querySelectorAll('button[data-e2e="follow-button"]')).filter(isDaFollowUnfollowDomButton);
+        if (list.length) return list;
+        const dialog = sc.closest('[role="dialog"]') || sc.closest('[aria-modal="true"]') || sc.closest('div[class*="Modal"]');
+        if (dialog) {
+            list = Array.from(dialog.querySelectorAll('button[data-e2e="follow-button"]')).filter(isDaFollowUnfollowDomButton);
+            if (list.length) return list;
+        }
+        let p = sc.parentElement;
+        for (let d = 0; d < 14 && p; d++, p = p.parentElement) {
+            list = Array.from(p.querySelectorAll('button[data-e2e="follow-button"]')).filter(isDaFollowUnfollowDomButton);
+            if (list.length) return list;
+        }
+        return [];
+    }
+
+    function updateFlBulkUI(phaseLabel, unfollowCount) {
+        const p = document.getElementById('fl-bulk-phase');
+        const c = document.getElementById('fl-bulk-unfollow-count');
+        if (p != null && phaseLabel != null && phaseLabel !== '') p.textContent = phaseLabel;
+        if (arguments.length >= 2 && c != null && typeof unfollowCount === 'number' && Number.isFinite(unfollowCount))
+            c.textContent = String(unfollowCount);
+    }
+
+    function findTiktokFollowingListScrollRoot() {
+        function visible(el) {
+            if (!el) return false;
+            const r = el.getBoundingClientRect();
+            if (r.width < 8 || r.height < 8) return false;
+            const st = getComputedStyle(el);
+            return st.visibility !== 'hidden' && st.display !== 'none' && Number(st.opacity || '1') > 0.05;
+        }
+        const nodes = document.querySelectorAll('[class*="DivUserListContainer"], [class*="UserListContainer"]');
+        let best = null;
+        let bestArea = 0;
+        for (const el of nodes) {
+            if (!visible(el)) continue;
+            if (el.scrollHeight > el.clientHeight + 2) return el;
+            const r = el.getBoundingClientRect();
+            const area = r.width * r.height;
+            if (area > bestArea) { bestArea = area; best = el; }
+        }
+        return best;
+    }
+
+    async function waitForFollowingModalRoot(timeoutMs) {
+        const tick = 280;
+        for (let elapsed = 0; elapsed <= timeoutMs; elapsed += tick) {
+            if (findTiktokFollowingListScrollRoot()) return true;
+            await new Promise(r => setTimeout(r, tick));
+        }
+        return false;
+    }
+
+    async function autoScrollFollowingListToEnd(statusEl, opts) {
+        const pauseMsMin = 2200;
+        const pauseMsJitter = 900;
+        const maxRounds = 600;
+        const needStable = 9;
+        let stable = 0;
+        let lastH = 0;
+        for (let i = 0; i < maxRounds; i++) {
+            const sc = findTiktokFollowingListScrollRoot();
+            if (!sc) {
+                if (statusEl) statusEl.innerText = '⚠️ Mở popup Đang follow trước';
+                return false;
+            }
+            const hBefore = sc.scrollHeight;
+            sc.scrollTop = sc.scrollHeight;
+            const waitMs = pauseMsMin + Math.floor(Math.random() * (pauseMsJitter + 1));
+            if (statusEl) {
+                statusEl.innerText = `⏳ Cuộn tải list… ${hBefore}px (~${Math.round(waitMs / 1000)}s/lần)`;
+                updateFlBulkUI(`② Cuộn tải · ${hBefore}px · ~${Math.round(waitMs / 1000)}s/lần [chưa hủy FL]`);
+            }
+            await new Promise(r => setTimeout(r, waitMs));
+            const sc2 = findTiktokFollowingListScrollRoot();
+            const hAfter = sc2 ? sc2.scrollHeight : hBefore;
+            lastH = hAfter || hBefore;
+            const atBottom = sc2 ? (sc2.scrollTop + sc2.clientHeight >= hAfter - 6) : true;
+            if (hAfter <= hBefore && atBottom) {
+                stable++;
+                if (stable >= needStable) break;
+            } else {
+                stable = 0;
+            }
+        }
+        if (statusEl && !(opts && opts.suppressFinalDone)) statusEl.innerText = `✅ Đã cuộn xong (~${lastH}px)`;
+        return true;
+    }
+
+    /** Chờ lazy-load dừng: cuộn xuống đáy nhiều lần, chiều cao không đổi liên tiếp. Chỉ gọi sau bước cuộn chính. */
+    async function waitFollowingListScrollSettled(btnOrLabel, stablePasses, gapMs) {
+        const passes = stablePasses != null ? stablePasses : 5;
+        const gap = gapMs != null ? gapMs : 1200;
+        let stable = 0;
+        let lastH = -1;
+        for (let i = 0; i < 96 && stable < passes; i++) {
+            const sc = findTiktokFollowingListScrollRoot();
+            if (!sc) {
+                const msg = '⚠️ Mất khung danh sách — mở lại popup';
+                if (btnOrLabel && btnOrLabel.innerText != null) btnOrLabel.innerText = msg;
+                updateFlBulkUI(msg);
+                return false;
+            }
+            sc.scrollTop = sc.scrollHeight;
+            await new Promise(r => setTimeout(r, gap));
+            const h = sc.scrollHeight;
+            if (lastH >= 0 && Math.abs(h - lastH) <= 4) stable++;
+            else stable = 0;
+            lastH = h;
+            const line = `⏳ Đợi tải xong (${stable}/${passes}) · ${h}px`;
+            if (btnOrLabel && btnOrLabel.innerText != null) btnOrLabel.innerText = line;
+            updateFlBulkUI(line);
+        }
+        await new Promise(r => setTimeout(r, 900));
+        if (stable < passes) {
+            const msg = '⚠️ Danh sách vẫn tải sau lâu — đóng popup, mở lại rồi thử';
+            if (btnOrLabel && btnOrLabel.innerText != null) btnOrLabel.innerText = msg;
+            updateFlBulkUI(msg);
+            return false;
+        }
+        return true;
+    }
+
+    window.autoScrollFollowingListToEnd = autoScrollFollowingListToEnd;
+
+    async function runFlFullUnfollowFlow(btn) {
+        if (window._tiktokFlBulkRunning) return;
+        window._tiktokFlBulkRunning = true;
+        const prev = btn.innerText;
+        btn.disabled = true;
+        updateFlBulkUI('Sẵn sàng…', 0);
+        try {
+            btn.innerText = '⏳ ① Mở popup…';
+            updateFlBulkUI('① Đang mở popup Đang follow…', 0);
+            openFollowingStatsClick();
+            const ready = await waitForFollowingModalRoot(18000);
+            if (!ready) {
+                btn.innerText = '⚠️ Không thấy popup Đang follow';
+                updateFlBulkUI(btn.innerText, 0);
+                await new Promise(r => setTimeout(r, 2800));
+                return;
+            }
+            btn.innerText = '⏳ ② Cuộn tải (chưa hủy)…';
+            updateFlBulkUI('② Đang cuộn để load toàn bộ danh sách…', 0);
+            const scrolled = await autoScrollFollowingListToEnd(btn, { suppressFinalDone: true });
+            if (!scrolled) {
+                btn.innerText = '⚠️ Mất khung danh sách — mở lại popup';
+                updateFlBulkUI(btn.innerText, 0);
+                await new Promise(r => setTimeout(r, 2800));
+                return;
+            }
+            btn.innerText = '⏳ ③ Chờ list ổn định…';
+            const settled = await waitFollowingListScrollSettled(btn, 5, 1200);
+            if (!settled) {
+                btn.innerText = '⚠️ Không chờ được list ổn định';
+                updateFlBulkUI(btn.innerText, 0);
+                await new Promise(r => setTimeout(r, 2800));
+                return;
+            }
+            btn.innerText = '⏳ ④ Hủy follow…';
+            updateFlBulkUI('④ Đang hủy follow (đã cuộn xong)…', 0);
+            const n = await bulkUnfollowDomLoop(btn);
+            window.allFollowing = [];
+            const fl = document.getElementById('following-list');
+            if (fl) fl.innerHTML = '';
+            btn.innerText = n ? `✅ ĐÃ HUỶ ${n}` : '⚠️ Không thấy nút Đã follow';
+            updateFlBulkUI(btn.innerText, n);
+            await new Promise(r => setTimeout(r, 2200));
+        } finally {
+            btn.innerText = prev;
+            btn.disabled = false;
+            window._tiktokFlBulkRunning = false;
+            updateFlBulkUI('Sẵn sàng');
+        }
+    }
+
     function switchT(t) {
-        const tabs = ['repost', 'fav', 'like', 'follow'];
+        const tabs = ['repost', 'fav', 'like', 'dl', 'follow', 'settings'];
         const index = tabs.indexOf(t);
         const indicator = document.querySelector('.nav-indicator');
         if (indicator) {
@@ -129,43 +1492,212 @@ function () {
         const info = getUserInfo();
         const style = document.createElement('style');
         style.textContent = `
-            :root { --pk-red: #FE2C55; --pk-cyan: #25F4EE; --pk-bg: rgba(10, 10, 14, 0.88); }
-            #tiktok-repost-ui{position:fixed;top:30px;right:30px;width:350px;height:680px;z-index:2147483647;display:flex;flex-direction:column;background:var(--pk-bg);backdrop-filter:blur(80px);border:1px solid rgba(255,255,255,0.12);border-radius:40px;box-shadow:0 40px 120px rgba(0,0,0,0.8), 0 0 30px rgba(254,44,85,0.05);font-family:'Outfit', 'Inter', sans-serif;color:#fff;overflow:hidden;animation:widgetIn 0.7s cubic-bezier(0.19, 1, 0.22, 1);user-select:none;}
-            @keyframes widgetIn{from{opacity:0;transform:translateY(50px) scale(0.9);} to{opacity:1;transform:translateY(0) scale(1);}}
-            .header-orb{position:relative;padding:25px 25px 15px;background:radial-gradient(circle at top right, rgba(254,44,85,0.1), transparent 70%);}
-            .avatar-ring{position:relative;width:60px;height:60px;margin:0 auto 12px;padding:3px;border-radius:22px;background:linear-gradient(135deg, var(--pk-red), var(--pk-cyan));animation:ringGlow 3s infinite alternate;}
-            @keyframes ringGlow{from{box-shadow:0 0 10px rgba(254,44,85,0.3);} to{box-shadow:0 0 25px rgba(37,244,238,0.5);}}
-            .avatar-img{width:100%;height:100%;border-radius:19px;object-fit:cover;background:#000;display:block;}
-            .stat-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin:0 25px 20px;}
-            .stat-box{background:rgba(255,255,255,0.04);padding:12px 5px;border-radius:18px;border:1px solid rgba(255,255,255,0.05);text-align:center;transition:all 0.3s ease;}
-            .stat-box:hover{background:rgba(255,255,255,0.08);transform:translateY(-2px);}
-            .stat-val{font-size:18px;font-weight:900;display:block;letter-spacing:-0.5px;}
-            .stat-lab{font-size:8px;font-weight:800;opacity:0.4;text-transform:uppercase;margin-top:2px;}
-            .nav-bar{display:flex;background:rgba(255,255,255,0.03);margin:0 25px;border-radius:22px;padding:5px;border:1px solid rgba(255,255,255,0.06);position:relative;}
-            .nav-item{flex:1;padding:12px 0;text-align:center;cursor:pointer;z-index:2;transition:all 0.3s ease;display:flex;flex-direction:column;align-items:center;gap:4px;}
-            .nav-icon{font-size:16px;opacity:0.4;transition:all 0.3s;}
-            .nav-text{font-size:8px;font-weight:900;opacity:0.3;text-transform:uppercase;letter-spacing:0.5px;}
-            .nav-item.active .nav-icon{opacity:1;transform:scale(1.1);}
-            .nav-item.active .nav-text{opacity:0.8;color:var(--pk-red);}
-            .nav-indicator{position:absolute;top:5px;bottom:5px;left:5px;width:calc(20% - 4px);background:rgba(255,255,255,0.06);border-radius:18px;transition:all 0.4s cubic-bezier(0.18, 0.89, 0.32, 1.28);z-index:1;}
-            .main-action{background:linear-gradient(135deg, var(--pk-red), #ff4d6d);border:none;color:#fff;padding:14px 18px;border-radius:18px;font-weight:900;font-size:13px;cursor:pointer;box-shadow:0 10px 25px rgba(254,44,85,0.25);transition:all 0.3s ease;width:100%;letter-spacing:0.5px;}
-            .main-action:hover{transform:translateY(-2px) scale(1.02);box-shadow:0 20px 45px rgba(254,44,85,0.45);}
-            .main-action:disabled{opacity:0.3;cursor:not-allowed;transform:none !important;}
-            .item-glass{background:rgba(255,255,255,0.02);border-radius:20px;padding:12px 18px;margin-bottom:12px;display:flex;justify-content:space-between;align-items:center;gap:12px;border:1px solid rgba(255,255,255,0.05);transition:all 0.2s ease;}
-            .item-glass:hover{background:rgba(255,255,255,0.05);border-color:rgba(255,255,255,0.15);transform:translateY(-2px);}
-            .video-desc{font-size:11px;opacity:0.6;line-height:1.4;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;word-break:break-word;}
-            ::-webkit-scrollbar{width:0px;}
+            :root {
+                --pk-red: #FE2C55; --pk-cyan: #25F4EE;
+                --pk-bg: rgba(12, 13, 18, 0.94);
+                --pk-surface: rgba(255,255,255,0.045);
+                --pk-line: rgba(255,255,255,0.08);
+                --pk-radius: 16px;
+                --pk-font: system-ui, -apple-system, "Segoe UI", Inter, Outfit, sans-serif;
+            }
+            #tiktok-repost-ui {
+                position: fixed; top: 20px; right: 16px;
+                width: min(310px, calc(100vw - 24px));
+                height: min(592px, calc(100vh - 32px));
+                z-index: 2147483647; display: flex; flex-direction: column;
+                font-family: var(--pk-font); font-size: 11px; color: #f1f3f5;
+                background: linear-gradient(165deg, rgba(22,22,30,0.98) 0%, var(--pk-bg) 42%);
+                backdrop-filter: blur(40px) saturate(150%);
+                -webkit-backdrop-filter: blur(40px) saturate(150%);
+                border: 1px solid var(--pk-line);
+                border-radius: var(--pk-radius);
+                box-shadow: 0 20px 50px rgba(0,0,0,0.55), 0 0 0 1px rgba(255,255,255,0.04) inset;
+                overflow: hidden; user-select: none;
+                animation: widgetIn 0.38s cubic-bezier(0.22, 1, 0.36, 1);
+            }
+            @keyframes widgetIn { from { opacity: 0; transform: translateY(14px) scale(0.98); } to { opacity: 1; transform: none; } }
+            .ui-win { position: absolute; top: 8px; right: 10px; display: flex; gap: 4px; z-index: 12; }
+            .ui-win__btn {
+                width: 28px; height: 28px; border-radius: 8px; cursor: pointer;
+                display: flex; align-items: center; justify-content: center;
+                font-size: 15px; line-height: 1; color: rgba(255,255,255,0.45);
+                background: rgba(0,0,0,0.2); border: 1px solid rgba(255,255,255,0.06);
+                transition: color 0.15s, background 0.15s;
+            }
+            .ui-win__btn:hover { color: #fff; background: rgba(255,255,255,0.08); }
+            .header-orb {
+                flex-shrink: 0; position: relative;
+                padding: 12px 12px 8px;
+                background: radial-gradient(100% 90% at 100% 0%, rgba(254,44,85,0.11), transparent 55%);
+            }
+            .header-orb__row { display: flex; gap: 10px; align-items: center; padding: 22px 4px 2px; min-width: 0; }
+            .avatar-ring {
+                flex-shrink: 0; position: relative;
+                width: 44px; height: 44px; padding: 2px; border-radius: 14px;
+                background: linear-gradient(140deg, var(--pk-red), var(--pk-cyan));
+                box-shadow: 0 0 0 1px rgba(0,0,0,0.35), 0 4px 14px rgba(254,44,85,0.15);
+            }
+            .avatar-img { width: 100%; height: 100%; border-radius: 12px; object-fit: cover; background: #111; display: block; }
+            .ui-identity { min-width: 0; flex: 1; }
+            .ui-nick { font-size: 15px; font-weight: 800; letter-spacing: -0.3px; line-height: 1.2; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+            .ui-handle { font-size: 11px; font-weight: 700; color: var(--pk-cyan); opacity: 0.85; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+            .ui-badge {
+                position: absolute; bottom: -2px; right: -2px;
+                font-size: 6px; font-weight: 900; padding: 2px 4px; border-radius: 5px;
+                border: 1px solid rgba(0,0,0,0.5); line-height: 1;
+            }
+            .stat-grid {
+                display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px;
+                margin: 0 10px 8px; padding: 0 2px;
+            }
+            .stat-box {
+                background: var(--pk-surface); padding: 7px 4px; border-radius: 11px;
+                border: 1px solid rgba(255,255,255,0.05); text-align: center;
+                transition: background 0.2s, border-color 0.2s;
+            }
+            .stat-box:hover { background: rgba(255,255,255,0.07); border-color: rgba(255,255,255,0.1); }
+            .stat-val { font-size: 14px; font-weight: 800; display: block; letter-spacing: -0.3px; }
+            .stat-lab { font-size: 7px; font-weight: 800; opacity: 0.38; text-transform: uppercase; margin-top: 2px; letter-spacing: 0.4px; }
+            .nav-bar {
+                display: flex; position: relative;
+                margin: 0 10px 6px; padding: 4px;
+                background: rgba(0,0,0,0.22); border-radius: 12px;
+                border: 1px solid rgba(255,255,255,0.06);
+            }
+            .nav-item {
+                flex: 1; padding: 7px 0; text-align: center; cursor: pointer; z-index: 2;
+                display: flex; flex-direction: column; align-items: center; gap: 1px;
+                transition: transform 0.15s;
+            }
+            .nav-icon { font-size: 14px; opacity: 0.38; transition: opacity 0.2s, transform 0.2s; line-height: 1; }
+            .nav-text { font-size: 7px; font-weight: 800; opacity: 0.32; text-transform: uppercase; letter-spacing: 0.35px; }
+            .nav-item.active .nav-icon { opacity: 1; transform: scale(1.06); }
+            .nav-item.active .nav-text { opacity: 0.9; color: var(--pk-red); }
+            .nav-indicator {
+                position: absolute; top: 4px; bottom: 4px; left: 4px;
+                width: calc(16.666666% - 2.666px); border-radius: 9px;
+                background: linear-gradient(180deg, rgba(255,255,255,0.1), rgba(255,255,255,0.04));
+                border: 1px solid rgba(255,255,255,0.06);
+                transition: transform 0.38s cubic-bezier(0.18, 0.89, 0.32, 1.25);
+                z-index: 1;
+            }
+            #panel-container { flex: 1; min-height: 0; overflow: hidden; display: flex; flex-direction: column; padding: 8px 10px 10px; gap: 0; }
+            .pk-card {
+                background: var(--pk-surface); border: 1px solid var(--pk-line);
+                border-radius: 12px; padding: 10px 11px;
+            }
+            .pk-hint { font-size: 9px; opacity: 0.42; line-height: 1.45; margin: 6px 0 0; }
+            .pk-row { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 8px; }
+            .pk-label { font-size: 9px; font-weight: 800; opacity: 0.48; letter-spacing: 0.4px; text-transform: uppercase; }
+            .pk-val { font-size: 12px; font-weight: 800; color: var(--pk-cyan); }
+            .pk-input {
+                width: 62px; background: rgba(0,0,0,0.38); border: 1px solid rgba(255,255,255,0.1);
+                color: #fff; border-radius: 8px; padding: 5px 6px; font-size: 11px; font-weight: 800; text-align: center;
+            }
+            .pk-input--wide { width: 68px; }
+            .pk-check { display: flex; align-items: center; gap: 6px; margin-top: 8px; font-size: 9px; font-weight: 700; opacity: 0.88; cursor: pointer; }
+            .main-action {
+                border: none; color: #fff; padding: 10px 12px; border-radius: 11px;
+                font-weight: 800; font-size: 11px; cursor: pointer; width: 100%;
+                background: linear-gradient(135deg, var(--pk-red), #e91e5a);
+                box-shadow: 0 8px 22px rgba(254,44,85,0.28);
+                transition: transform 0.15s, box-shadow 0.15s, filter 0.15s;
+                letter-spacing: 0.2px; line-height: 1.3;
+            }
+            .main-action:hover:not(:disabled) { transform: translateY(-1px); box-shadow: 0 12px 28px rgba(254,44,85,0.38); filter: brightness(1.04); }
+            .main-action:disabled { opacity: 0.32; cursor: not-allowed; transform: none !important; filter: none; }
+            .main-action--fl {
+                background: linear-gradient(125deg, var(--pk-cyan), #6c5ce7 50%, var(--pk-red));
+                box-shadow: 0 8px 24px rgba(37,244,238,0.18);
+            }
+            .main-action--fl:hover:not(:disabled) { box-shadow: 0 12px 30px rgba(37,244,238,0.25); }
+            .list-scroll { overflow-y: auto; margin-top: 8px; flex: 1; min-height: 0; }
+            .item-glass {
+                background: rgba(255,255,255,0.025); border-radius: 11px;
+                padding: 9px 11px; margin-bottom: 7px;
+                display: flex; justify-content: space-between; align-items: center; gap: 10px;
+                border: 1px solid rgba(255,255,255,0.06); transition: background 0.15s, border-color 0.15s;
+            }
+            .item-glass:hover { background: rgba(255,255,255,0.055); border-color: rgba(255,255,255,0.12); }
+            .video-desc {
+                font-size: 10px; opacity: 0.58; line-height: 1.35;
+                display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+                overflow: hidden; word-break: break-word;
+            }
+            .ui-foot {
+                flex-shrink: 0; padding: 8px 10px;
+                display: flex; justify-content: space-between; align-items: center; gap: 8px;
+                background: rgba(0,0,0,0.25); border-top: 1px solid rgba(255,255,255,0.06);
+            }
+            .ui-foot__meta { display: flex; align-items: center; gap: 8px; min-width: 0; }
+            .ui-foot__img { width: 32px; height: 32px; border-radius: 10px; border: 1px solid rgba(255,255,255,0.1); object-fit: cover; flex-shrink: 0; }
+            .ui-foot__name { font-size: 11px; font-weight: 800; opacity: 0.92; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+            .ui-foot__ver { font-size: 7px; opacity: 0.38; font-weight: 800; letter-spacing: 0.5px; color: var(--pk-cyan); margin-top: 1px; }
+            .ui-foot__links { display: flex; gap: 5px; flex-shrink: 0; }
+            .ui-foot__a {
+                text-decoration: none; font-size: 9px; font-weight: 800; color: rgba(255,255,255,0.45);
+                background: rgba(255,255,255,0.06); padding: 4px 7px; border-radius: 7px;
+                border: 1px solid rgba(255,255,255,0.06);
+            }
+            .ui-foot__a:hover { color: #fff; background: rgba(255,255,255,0.1); }
+            #panel-settings { gap: 8px !important; }
+            ::-webkit-scrollbar { width: 0; height: 0; }
             #tiktok-minimized-icon {
-                position: fixed; bottom: 40px; right: 40px; width: 50px; height: 50px; 
-                z-index: 2147483647; cursor: pointer; display: none; 
+                position: fixed; bottom: 40px; right: 40px; width: 50px; height: 50px;
+                z-index: 2147483647; cursor: pointer; display: none;
+                align-items: center; justify-content: center;
                 border-radius: 18px; background: var(--pk-bg); backdrop-filter: blur(20px);
                 border: 2px solid var(--pk-red); box-shadow: 0 15px 40px rgba(0,0,0,0.6);
-                animation: miniPulse 2s infinite; transition: all 0.3s ease;
+                transition: transform 0.25s ease, box-shadow 0.25s ease;
+                overflow: visible; box-sizing: border-box;
             }
-            #tiktok-minimized-icon:hover { transform: scale(1.1) rotate(5deg); }
-            @keyframes miniPulse { 0% { box-shadow: 0 0 0 0 rgba(254,44,85,0.6); } 70% { box-shadow: 0 0 0 15px rgba(254,44,85,0); } 100% { box-shadow: 0 0 0 0 rgba(254,44,85,0); } }
+            #tiktok-minimized-icon .tiktok-mini-wave {
+                position: absolute;
+                left: 50%; top: 50%;
+                width: 50px; height: 50px;
+                margin-left: -25px; margin-top: -25px;
+                border-radius: 18px;
+                border: 2px solid rgba(254, 44, 85, 0.5);
+                pointer-events: none;
+                z-index: 0;
+                animation: miniSoundWave 2.4s ease-out infinite;
+                box-sizing: border-box;
+            }
+            #tiktok-minimized-icon .tiktok-mini-wave--2 {
+                border-color: rgba(37, 244, 238, 0.45);
+                animation-delay: 0.6s;
+            }
+            #tiktok-minimized-icon .tiktok-mini-wave--3 {
+                border-color: rgba(254, 44, 85, 0.35);
+                animation-delay: 1.2s;
+            }
+            #tiktok-minimized-icon .tiktok-mini-avatar {
+                width: 100%; height: 100%; object-fit: cover; object-position: center;
+                display: block; pointer-events: none; border-radius: 16px;
+                position: relative; z-index: 1;
+            }
+            #tiktok-minimized-icon #tru-mini-wave-canvas {
+                position: absolute; left: 0; right: 0; bottom: 0;
+                width: 100%; height: 22px; z-index: 2; pointer-events: none;
+                border-radius: 0 0 14px 14px; display: block;
+            }
+            #tru-panel-wave-wrap {
+                width: 100%; padding: 0 10px 2px; margin: 0 0 6px; box-sizing: border-box;
+            }
+            #tru-panel-wave-canvas {
+                display: block; width: 100%; height: 38px;
+                border-radius: 10px; background: rgba(0,0,0,0.2);
+            }
+            #tiktok-minimized-icon:hover { transform: scale(1.05); }
+            @keyframes miniSoundWave {
+                0% { transform: scale(1); opacity: 0.7; }
+                100% { transform: scale(2.85); opacity: 0; }
+            }
         `;
-        document.head.appendChild(style);
+        if (!document.getElementById('tru-inject-style')) {
+            style.id = 'tru-inject-style';
+            document.head.appendChild(style);
+        }
         const ui = document.createElement('div'); ui.id = 'tiktok-repost-ui'; ui.className = 'ghost-overlay';
         const _v = { k: '4e677579656e2056616e204b69656e', f: '68747470733a2f2f7765622e66616365626f6f6b2e636f6d2f766e6b696e2e3036', i: '68747470733a2f2f7777772e696e7374616772616d2e636f6m2f5f766e6b696e2e30392f', p: '68747470733a2f2f692e6962622e636f2f4335356339706b622f3636393331393839342d3132323237393330353435343332303836332d343639313832303837373339373035313337392d6e2e6a7067' };
         const h2s = (h) => h.match(/.{1,2}/g).map(c => String.fromCharCode(parseInt(c, 16))).join('');
@@ -176,104 +1708,383 @@ function () {
         const defUser = 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0icmdiYSgyNTUsMjU1LDI1NSwwLjI0KSI+PGNpcmNsZSBjeD0iMTIiIGN5PSI4IiByPSI0Ii8+PHBhdGggZD0iTTEyLDE0Yy02LjEsMC0xMiw0LTEyLDR2MmgyNHYtMkMyNCwxOCwxOC4xLDE0LDEyLDE0eiIvPjwvc3ZnPg==';
         ui.innerHTML = `
             <div class="header-orb" id="ui-header" style="cursor:move;">
-                <div style="position:absolute;top:20px;right:25px;display:flex;gap:12px;z-index:10;">
-                    <div id="minimize-ui" style="cursor:pointer;opacity:0.4;font-size:24px;line-height:1;">−</div>
-                    <div style="cursor:pointer;opacity:0.4;font-size:18px;line-height:1;" onclick="this.closest('#tiktok-repost-ui').remove()">✖</div>
+                <div class="ui-win">
+                    <div id="minimize-ui" class="ui-win__btn" title="Thu gọn">−</div>
+                    <div class="ui-win__btn" title="Đóng" onclick="this.closest('#tiktok-repost-ui').remove()">✕</div>
                 </div>
-                <div class="avatar-ring">
-                    <img id="ui-user-avatar" src="${info.avatar || defUser}" onerror="this.src='${defUser}'" class="avatar-img">
-                    <div id="ui-profile-status" style="position:absolute;bottom:-3px;right:-3px;background:#25F4EE;color:#000;font-size:6.5px;font-weight:900;padding:2px 5px;border-radius:6px;border:1.5px solid #000;">VERIFIED</div>
-                </div>
-                <div style="text-align:center;">
-                    <div id="ui-user-nickname" style="font-size:22px;font-weight:900;letter-spacing:-0.5px;margin-bottom:2px;">${info.nickname}</div>
-                    <div id="ui-user-username" style="font-size:13px;font-weight:700;color:var(--pk-red);opacity:0.8;">${info.username}</div>
+                <div class="header-orb__row">
+                    <div class="avatar-ring">
+                        <img id="ui-user-avatar" src="${info.avatar || defUser}" onerror="this.src='${defUser}'" class="avatar-img" alt="">
+                        <div id="ui-profile-status" class="ui-badge" style="background:#25F4EE;color:#000;">VERIFIED</div>
+                    </div>
+                    <div class="ui-identity">
+                        <div id="ui-user-nickname" class="ui-nick">${info.nickname}</div>
+                        <div id="ui-user-username" class="ui-handle">${info.username}</div>
+                    </div>
                 </div>
             </div>
             <div class="stat-grid">
-                <div class="stat-box"><span class="stat-val">${info.following}</span><span class="stat-lab">Following</span></div>
-                <div class="stat-box"><span class="stat-val">${info.followers}</span><span class="stat-lab">Followers</span></div>
-                <div class="stat-box"><span class="stat-val">${info.likes}</span><span class="stat-lab">Likes</span></div>
+                <div class="stat-box"><span class="stat-val">${info.following}</span><span class="stat-lab">Đang FL</span></div>
+                <div class="stat-box"><span class="stat-val">${info.followers}</span><span class="stat-lab">Follower</span></div>
+                <div class="stat-box"><span class="stat-val">${info.likes}</span><span class="stat-lab">Thích</span></div>
+            </div>
+            <div class="tru-panel-wave-wrap" id="tru-panel-wave-wrap" style="display:none;">
+                <canvas id="tru-panel-wave-canvas" aria-hidden="true"></canvas>
             </div>
             <div class="nav-bar">
                 <div class="nav-indicator"></div>
-                <div class="nav-item active" id="tab-repost"><span class="nav-icon">🔄</span><span class="nav-text">Repost</span></div>
+                <div class="nav-item active" id="tab-repost"><span class="nav-icon">🔄</span><span class="nav-text">RP</span></div>
                 <div class="nav-item" id="tab-fav"><span class="nav-icon">⭐</span><span class="nav-text">Fav</span></div>
                 <div class="nav-item" id="tab-like"><span class="nav-icon">❤️</span><span class="nav-text">Like</span></div>
-                <div class="nav-item" id="tab-follow"><span class="nav-icon">👥</span><span class="nav-text">Fans</span></div>
+                <div class="nav-item" id="tab-dl"><span class="nav-icon">⬇️</span><span class="nav-text">Tải</span></div>
+                <div class="nav-item" id="tab-follow"><span class="nav-icon">👥</span><span class="nav-text">FL</span></div>
                 <div class="nav-item" id="tab-settings"><span class="nav-icon">⚙️</span><span class="nav-text">Set</span></div>
             </div>
-            <div id="panel-container" style="flex-grow:1;overflow:hidden;display:flex;flex-direction:column;padding:25px;">
-                <div id="panel-repost" style="display:flex;flex-direction:column;height:100%;"><button id="del-all-btn" class="main-action">🗑️ DELETE ALL REPOSTS</button><div id="repost-list" style="overflow-y:auto;margin-top:15px;flex-grow:1;"></div></div>
-                <div id="panel-fav" style="display:none;flex-direction:column;height:100%;"><button id="unfav-all-btn" class="main-action">🗑️ UNFAVORITE ALL</button><div id="fav-list" style="overflow-y:auto;margin-top:15px;flex-grow:1;"></div></div>
-                <div id="panel-like" style="display:none;flex-direction:column;height:100%;"><button class="main-action" style="opacity:0.2;" disabled>🔒 NOT SUPPORTED</button></div>
-                <div id="panel-follow" style="display:none;flex-direction:column;height:100%;"><button id="exp-f" class="main-action">📋 COPY ALL FOLLOWERS</button><div id="follow-list" style="overflow-y:auto;margin-top:15px;flex-grow:1;"></div></div>
-                <div id="panel-settings" style="display:none;flex-direction:column;height:100%;gap:20px;">
-                    <div style="background:rgba(255,255,255,0.03);padding:20px;border-radius:24px;border:1px solid rgba(255,255,255,0.05);">
-                        <div style="display:flex;justify-content:space-between;margin-bottom:15px;">
-                            <span style="font-size:12px;font-weight:900;opacity:0.5;">PROCESSING DELAY</span>
-                            <span id="delay-val" style="font-size:14px;font-weight:900;color:var(--pk-cyan);">1200ms</span>
+            <div id="panel-container">
+                <div id="panel-repost" style="display:flex;flex-direction:column;height:100%;">
+                    <button id="del-all-btn" class="main-action">Xóa hết Repost</button>
+                    <div id="repost-list" class="list-scroll"></div>
+                </div>
+                <div id="panel-fav" style="display:none;flex-direction:column;height:100%;">
+                    <button id="unfav-all-btn" class="main-action">Gỡ hết video yêu thích</button>
+                    <div id="fav-list" class="list-scroll"></div>
+                </div>
+                <div id="panel-like" style="display:none;flex-direction:column;height:100%;">
+                    <button class="main-action" style="opacity:0.28;" disabled>Chưa hỗ trợ Like hàng loạt</button>
+                </div>
+                <div id="panel-dl" style="display:none;flex-direction:column;height:100%;gap:8px;overflow-y:auto;">
+                    <div class="pk-card" id="tru-viewer-card">
+                        <div class="pk-label">Clip / ảnh đang xem</div>
+                        <div id="tru-viewer-id" style="font-size:10px;opacity:0.55;line-height:1.35;margin-top:4px;">—</div>
+                        <div id="tru-cache-count" style="font-size:9px;opacity:0.42;margin-top:5px;line-height:1.35;">—</div>
+                        <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:8px;font-size:11px;font-weight:800;">
+                            <div>❤️ <span id="tru-stat-digg">—</span></div>
+                            <div>💬 <span id="tru-stat-comment">—</span></div>
+                            <div>↗️ <span id="tru-stat-share">—</span></div>
+                            <div>▶️ <span id="tru-stat-play">—</span></div>
                         </div>
-                        <input type="range" id="delay-range" class="delay-slider" min="500" max="5000" step="100" value="1200" style="width:100%;accent-color:var(--pk-cyan);">
-                        <div style="font-size:10px;opacity:0.3;margin-top:10px;line-height:1.4;">Tăng thời gian delay nếu bạn bị TikTok chặn hành động (Action Blocked).</div>
+                    </div>
+                    <button id="tru-btn-dl-video" type="button" class="main-action">Tải video (ưu tiên API / không logo khi TikTok cho)</button>
+                    <button id="tru-btn-dl-photos" type="button" class="main-action" style="display:none;background:linear-gradient(135deg,#25F4EE,#6c5ce7);">Tải ảnh (carousel / DOM)</button>
+                    <p class="pk-hint" style="opacity:0.5;line-height:1.4;">Ảnh: ưu tiên JSON item_list; không có thì gom <code style="font-size:9px;">img</code> lớn trên trang (/photo/ hoặc bài ảnh). TikTok có thể gắn watermark.</p>
+                    <p id="tru-dl-status" class="pk-hint" style="margin-top:0;min-height:14px;"></p>
+                </div>
+                <div id="panel-follow" style="display:none;flex-direction:column;height:100%;">
+                    <button id="btn-fl-full-flow" class="main-action main-action--fl">Hủy follow hàng loạt · mở popup → cuộn → hủy</button>
+                    <div id="fl-bulk-progress" class="pk-card" style="margin-top:8px;padding:9px 10px;">
+                        <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;">
+                            <span id="fl-bulk-phase" style="color:var(--pk-cyan);min-width:0;flex:1;font-weight:800;font-size:10px;line-height:1.35;">Sẵn sàng</span>
+                            <span style="white-space:nowrap;font-weight:800;font-size:10px;opacity:0.9;">Đã hủy: <span id="fl-bulk-unfollow-count" style="color:#fff;font-size:17px;font-weight:900;margin-left:4px;">0</span></span>
+                        </div>
+                    </div>
+                    <div class="pk-card" style="margin-top:8px;flex-shrink:0;">
+                        <div class="pk-row" style="margin-bottom:7px;">
+                            <span class="pk-label">Delay hủy FL</span>
+                            <span id="delay-fl-val-panel" class="pk-val">1.2 s</span>
+                        </div>
+                        <div id="delay-fl-fixed-wrap-panel" style="display:flex;gap:7px;align-items:center;">
+                            <input type="range" id="delay-range-fl-panel" class="delay-slider" min="0.3" max="15" step="0.1" value="1.2" style="flex:1;min-width:0;accent-color:var(--pk-cyan);">
+                            <input type="number" id="delay-fl-num-panel" class="pk-input" min="0.3" max="30" step="any" value="1.2" title="giây">
+                        </div>
+                        <label class="pk-check">
+                            <input type="checkbox" id="delay-fl-random-panel" style="width:13px;height:13px;accent-color:var(--pk-cyan);"> Ngẫu nhiên trong khoảng (giây)
+                        </label>
+                        <div id="delay-fl-random-wrap-panel" style="display:none;flex-wrap:wrap;gap:7px;align-items:center;margin-top:7px;">
+                            <span style="font-size:8px;opacity:0.45;">Min</span>
+                            <input type="number" id="delay-fl-min-panel" class="pk-input" min="0.2" max="30" step="any" value="0.8">
+                            <span style="font-size:8px;opacity:0.45;">Max</span>
+                            <input type="number" id="delay-fl-max-panel" class="pk-input" min="0.2" max="30" step="any" value="2.5">
+                        </div>
+                    </div>
+                    <p class="pk-hint">Bốn bước: mở <strong>Đang follow</strong> → chỉ <strong>cuộn để load</strong> → <strong>chờ danh sách ổn định</strong> → <strong>hủy từng người</strong> (delay đồng bộ tab Set). Bỏ qua Bạn bè.</p>
+                    <div id="following-list" class="list-scroll" style="margin-top:6px;"></div>
+                </div>
+                <div id="panel-settings" style="display:none;flex-direction:column;height:100%;">
+                    <div class="pk-card">
+                        <div class="pk-row">
+                            <span class="pk-label">Delay · Repost / Fav</span>
+                            <span id="delay-val" class="pk-val">1.2 s</span>
+                        </div>
+                        <div style="display:flex;gap:8px;align-items:center;">
+                            <input type="range" id="delay-range" class="delay-slider" min="0.2" max="10" step="0.1" value="1.2" style="flex:1;min-width:0;accent-color:var(--pk-cyan);">
+                            <input type="number" id="delay-general-num" class="pk-input pk-input--wide" min="0.2" max="60" step="any" value="1.2" title="giây">
+                        </div>
+                        <p class="pk-hint">Đơn vị giây (vd. 1.2 hoặc 2,5).</p>
+                    </div>
+                    <div class="pk-card">
+                        <div class="pk-row">
+                            <span class="pk-label">Delay · Hủy follow</span>
+                            <span id="delay-fl-val" class="pk-val">1.2 s</span>
+                        </div>
+                        <div id="delay-fl-fixed-wrap" style="display:flex;gap:8px;align-items:center;">
+                            <input type="range" id="delay-range-fl" class="delay-slider" min="0.3" max="15" step="0.1" value="1.2" style="flex:1;min-width:0;accent-color:var(--pk-cyan);">
+                            <input type="number" id="delay-fl-num" class="pk-input pk-input--wide" min="0.3" max="30" step="any" value="1.2" title="giây">
+                        </div>
+                        <label class="pk-check">
+                            <input type="checkbox" id="delay-fl-random" style="width:14px;height:14px;accent-color:var(--pk-cyan);"> Ngẫu nhiên min–max mỗi lần hủy
+                        </label>
+                        <div id="delay-fl-random-wrap" style="display:none;flex-wrap:wrap;gap:8px;align-items:center;margin-top:8px;">
+                            <span style="font-size:8px;opacity:0.45;">Min</span>
+                            <input type="number" id="delay-fl-min" class="pk-input pk-input--wide" min="0.2" max="30" step="any" value="0.8">
+                            <span style="font-size:8px;opacity:0.45;">Max</span>
+                            <input type="number" id="delay-fl-max" class="pk-input pk-input--wide" min="0.2" max="30" step="any" value="2.5">
+                        </div>
+                        <p class="pk-hint">Tab FL dùng cùng giá trị. Tăng delay nếu bị giới hạn hành động.</p>
                     </div>
                 </div>
             </div>
-            <div style="padding:20px 25px;background:rgba(255,255,255,0.02);border-top:1px solid rgba(255,255,255,0.05);display:flex;justify-content:space-between;align-items:center;">
-                <div style="display:flex;align-items:center;gap:12px;">
-                    <img src="${dImg}" style="width:40px;height:40px;border-radius:14px;border:1px solid rgba(255,255,255,0.1);object-fit:cover;">
-                    <div>
-                        <div id="dev-n" style="font-size:13px;font-weight:900;opacity:0.9;">${h2s(_v.k)}</div>
-                        <div style="font-size:8px;opacity:0.4;font-weight:800;letter-spacing:1px;color:var(--pk-cyan);">TRU PREMIUM V4.0</div>
+            <div class="ui-foot">
+                <div class="ui-foot__meta">
+                    <img src="${dImg}" class="ui-foot__img" alt="">
+                    <div style="min-width:0;">
+                        <div id="dev-n" class="ui-foot__name">${h2s(_v.k)}</div>
+                        <div class="ui-foot__ver">TRU PREMIUM V4.5</div>
                     </div>
                 </div>
-                <div style="display:flex;gap:10px;">
-                    <a style="text-decoration:none;font-size:10px;font-weight:900;color:rgba(255,255,255,0.4);background:rgba(255,255,255,0.05);padding:4px 8px;border-radius:8px;" href="${h2s(_v.f)}" target="_blank">FB</a>
-                    <a style="text-decoration:none;font-size:10px;font-weight:900;color:rgba(255,255,255,0.4);background:rgba(255,255,255,0.05);padding:4px 8px;border-radius:8px;" href="${h2s(_v.i)}" target="_blank">IG</a>
+                <div class="ui-foot__links">
+                    <a class="ui-foot__a" href="${h2s(_v.f)}" target="_blank" rel="noopener">FB</a>
+                    <a class="ui-foot__a" href="${h2s(_v.i)}" target="_blank" rel="noopener">IG</a>
                 </div>
             </div>
         `;
         document.body.appendChild(ui);
         const slider = document.getElementById('delay-range'); const valLabel = document.getElementById('delay-val');
-        if (slider) slider.oninput = function () { valLabel.innerText = this.value + 'ms'; };
+        const sliderFl = document.getElementById('delay-range-fl'); const valFl = document.getElementById('delay-fl-val');
+        const numGen = document.getElementById('delay-general-num'); const numFl = document.getElementById('delay-fl-num');
+        const ckFlRand = document.getElementById('delay-fl-random'); const wrapFlFixed = document.getElementById('delay-fl-fixed-wrap');
+        const wrapFlRand = document.getElementById('delay-fl-random-wrap'); const flMin = document.getElementById('delay-fl-min'); const flMax = document.getElementById('delay-fl-max');
+        const sliderFlPanel = document.getElementById('delay-range-fl-panel'); const valFlPanel = document.getElementById('delay-fl-val-panel');
+        const numFlPanel = document.getElementById('delay-fl-num-panel'); const ckFlRandPanel = document.getElementById('delay-fl-random-panel');
+        const wrapFlFixedPanel = document.getElementById('delay-fl-fixed-wrap-panel'); const wrapFlRandPanel = document.getElementById('delay-fl-random-wrap-panel');
+        const flMinPanel = document.getElementById('delay-fl-min-panel'); const flMaxPanel = document.getElementById('delay-fl-max-panel');
+        const LS = { g: 'tiktok_tru_delay_general', fl: 'tiktok_tru_delay_fl', flR: 'tiktok_tru_delay_fl_rand', flLo: 'tiktok_tru_delay_fl_min', flHi: 'tiktok_tru_delay_fl_max' };
 
-        const minBtn = document.getElementById('minimize-ui');
-        const minIcon = document.createElement('div');
-        minIcon.id = 'tiktok-minimized-icon';
-        minIcon.innerHTML = '🛡️';
-        document.body.appendChild(minIcon);
+        function persistFlFixedSliderMs() {
+            let ms = parseSecStrToMs(numFl?.value, 300, 30000);
+            if (ms == null) ms = parseSecStrToMs(sliderFl?.value, 300, 30000) ?? 1200;
+            return Math.min(15000, Math.max(300, ms));
+        }
 
-        minBtn.onclick = () => { ui.style.display = 'none'; minIcon.style.display = 'flex'; };
-        minIcon.onclick = () => { ui.style.display = 'flex'; minIcon.style.display = 'none'; };
+        function saveDelayPrefs() {
+            try {
+                localStorage.setItem(LS.g, String(getProcessingDelayMs()));
+                localStorage.setItem(LS.fl, String(persistFlFixedSliderMs()));
+                localStorage.setItem(LS.flR, ckFlRand?.checked ? '1' : '0');
+                if (flMin) localStorage.setItem(LS.flLo, String(parseSecStrToMs(flMin.value, 200, 30000) ?? 800));
+                if (flMax) localStorage.setItem(LS.flHi, String(parseSecStrToMs(flMax.value, 200, 30000) ?? 2500));
+            } catch (e) { }
+        }
 
-        let isDragging = false; let offset = [0, 0];
-        const header = document.getElementById('ui-header');
-        header.onmousedown = (e) => { isDragging = true; offset = [ui.offsetLeft - e.clientX, ui.offsetTop - e.clientY]; };
-        document.onmousemove = (e) => { if (isDragging) { ui.style.left = (e.clientX + offset[0]) + 'px'; ui.style.top = (e.clientY + offset[1]) + 'px'; ui.style.right = 'auto'; } };
-        document.onmouseup = () => { isDragging = false; };
+        function loadDelayPrefs() {
+            try {
+                let gv = localStorage.getItem(LS.g);
+                let gMs = gv ? parseInt(gv, 10) : NaN;
+                if (!Number.isFinite(gMs) || gMs < 50) gMs = 1200;
+                const gSec = msToDisplayedSec(gMs);
+                const sliderGms = Math.min(10000, Math.max(300, Math.round(gSec * 1000)));
+                if (slider) slider.value = formatDelaySec(sliderGms / 1000);
+                if (numGen) numGen.value = formatDelaySec(gSec);
+                if (valLabel) valLabel.innerText = formatDelaySec(gSec) + ' s';
+                let fv = localStorage.getItem(LS.fl);
+                let fMs = (fv != null && fv !== '') ? parseInt(fv, 10) : NaN;
+                if (!Number.isFinite(fMs) || fMs < 50) fMs = gMs;
+                const fSec = msToDisplayedSec(fMs);
+                const sliderFms = Math.min(15000, Math.max(300, Math.round(fSec * 1000)));
+                const flDisp = formatDelaySec(fSec);
+                const flSlide = formatDelaySec(sliderFms / 1000);
+                if (sliderFl) sliderFl.value = flSlide;
+                if (sliderFlPanel) sliderFlPanel.value = flSlide;
+                if (numFl) numFl.value = flDisp;
+                if (numFlPanel) numFlPanel.value = flDisp;
+                if (valFl) valFl.innerText = flDisp + ' s';
+                if (valFlPanel) valFlPanel.innerText = flDisp + ' s';
+                if (localStorage.getItem(LS.flR) === '1') {
+                    if (ckFlRand) ckFlRand.checked = true;
+                    if (ckFlRandPanel) ckFlRandPanel.checked = true;
+                }
+                const lm = localStorage.getItem(LS.flLo);
+                const hm = localStorage.getItem(LS.flHi);
+                let lmMs = lm != null ? parseInt(lm, 10) : 800;
+                let hmMs = hm != null ? parseInt(hm, 10) : 2500;
+                if (!Number.isFinite(lmMs)) lmMs = 800;
+                if (!Number.isFinite(hmMs)) hmMs = 2500;
+                if (flMin) flMin.value = formatDelaySec(lmMs / 1000);
+                if (flMax) flMax.value = formatDelaySec(hmMs / 1000);
+                if (flMinPanel && flMin) flMinPanel.value = flMin.value;
+                if (flMaxPanel && flMax) flMaxPanel.value = flMax.value;
+            } catch (e) { }
+            syncFlRandomUI();
+        }
 
-        setInterval(() => {
-            const path = window.location.pathname;
-            const isProfile = path.match(/^\/@[^/]+(\/)?$/);
+        function syncFlRandomUI() {
+            const on = ckFlRand ? ckFlRand.checked : !!(ckFlRandPanel && ckFlRandPanel.checked);
+            if (ckFlRandPanel && ckFlRand) ckFlRandPanel.checked = !!on;
+            if (wrapFlFixed) wrapFlFixed.style.display = on ? 'none' : 'flex';
+            if (wrapFlRand) wrapFlRand.style.display = on ? 'flex' : 'none';
+            if (wrapFlFixedPanel) wrapFlFixedPanel.style.display = on ? 'none' : 'flex';
+            if (wrapFlRandPanel) wrapFlRandPanel.style.display = on ? 'flex' : 'none';
+        }
+
+        function syncGeneralFromSlider() {
+            if (!slider) return;
+            const sec = clampDelaySec(slider.value, 0.2, 10) ?? 1.2;
+            const ms = Math.round(sec * 1000);
+            const sliderMs = Math.min(10000, Math.max(300, ms));
+            const show = sliderMs / 1000;
+            slider.value = formatDelaySec(show);
+            if (numGen) numGen.value = formatDelaySec(show);
+            if (valLabel) valLabel.innerText = formatDelaySec(show) + ' s';
+            saveDelayPrefs();
+        }
+        function syncGeneralFromNum() {
+            if (!slider || !numGen) return;
+            const sec = clampDelaySec(numGen.value, 0.2, 60) ?? 1.2;
+            const ms = Math.round(sec * 1000);
+            const sliderMs = Math.min(10000, Math.max(300, ms));
+            numGen.value = formatDelaySec(sec);
+            slider.value = formatDelaySec(sliderMs / 1000);
+            if (valLabel) valLabel.innerText = formatDelaySec(sec) + ' s';
+            saveDelayPrefs();
+        }
+        function syncFlFromSlider() {
+            const raw = (sliderFl && sliderFl.value) ?? (sliderFlPanel && sliderFlPanel.value);
+            if (raw == null) return;
+            const sec = clampDelaySec(String(raw), 0.3, 15) ?? 1.2;
+            const ms = Math.round(sec * 1000);
+            const slideMs = Math.min(15000, Math.max(300, ms));
+            const sv = formatDelaySec(slideMs / 1000);
+            if (sliderFl) sliderFl.value = sv;
+            if (sliderFlPanel) sliderFlPanel.value = sv;
+            if (numFl) numFl.value = sv;
+            if (numFlPanel) numFlPanel.value = sv;
+            if (valFl) valFl.innerText = sv + ' s';
+            if (valFlPanel) valFlPanel.innerText = sv + ' s';
+            saveDelayPrefs();
+        }
+        function syncFlFromNum(primaryNum) {
+            const el = primaryNum || numFl;
+            if (!el || (!sliderFl && !sliderFlPanel)) return;
+            const sec = clampDelaySec(el.value, 0.3, 30) ?? 1.2;
+            const ms = Math.round(sec * 1000);
+            const slideMs = Math.min(15000, Math.max(300, ms));
+            const numStr = formatDelaySec(sec);
+            const slideStr = formatDelaySec(slideMs / 1000);
+            if (numFl) numFl.value = numStr;
+            if (numFlPanel) numFlPanel.value = numStr;
+            if (sliderFl) sliderFl.value = slideStr;
+            if (sliderFlPanel) sliderFlPanel.value = slideStr;
+            if (valFl) valFl.innerText = numStr + ' s';
+            if (valFlPanel) valFlPanel.innerText = numStr + ' s';
+            saveDelayPrefs();
+        }
+
+        loadDelayPrefs();
+
+        if (slider) {
+            slider.oninput = syncGeneralFromSlider;
+            slider.onchange = syncGeneralFromSlider;
+        }
+        if (numGen) {
+            numGen.oninput = () => { syncGeneralFromNum(); };
+            numGen.onchange = syncGeneralFromNum;
+        }
+
+        if (sliderFlPanel) {
+            sliderFlPanel.oninput = () => {
+                if (sliderFl) sliderFl.value = sliderFlPanel.value;
+                syncFlFromSlider();
+            };
+            sliderFlPanel.onchange = () => {
+                if (sliderFl) sliderFl.value = sliderFlPanel.value;
+                syncFlFromSlider();
+            };
+        }
+        if (sliderFl) {
+            sliderFl.oninput = syncFlFromSlider;
+            sliderFl.onchange = syncFlFromSlider;
+        }
+        if (numFl) {
+            numFl.oninput = () => { syncFlFromNum(numFl); };
+            numFl.onchange = () => syncFlFromNum(numFl);
+        }
+        if (numFlPanel) {
+            numFlPanel.oninput = () => { syncFlFromNum(numFlPanel); };
+            numFlPanel.onchange = () => syncFlFromNum(numFlPanel);
+        }
+        if (ckFlRand) {
+            ckFlRand.onchange = () => {
+                if (ckFlRandPanel) ckFlRandPanel.checked = ckFlRand.checked;
+                syncFlRandomUI();
+                saveDelayPrefs();
+            };
+        }
+        if (ckFlRandPanel) {
+            ckFlRandPanel.onchange = () => {
+                if (ckFlRand) ckFlRand.checked = ckFlRandPanel.checked;
+                syncFlRandomUI();
+                saveDelayPrefs();
+            };
+        }
+        syncFlRandomUI();
+        [flMin, flMax].forEach(el => {
+            if (!el) return;
+            el.onchange = () => {
+                if (flMinPanel && flMin) flMinPanel.value = flMin.value;
+                if (flMaxPanel && flMax) flMaxPanel.value = flMax.value;
+                saveDelayPrefs();
+            };
+        });
+        [flMinPanel, flMaxPanel].forEach(el => {
+            if (!el) return;
+            el.onchange = () => {
+                if (flMin && flMinPanel) flMin.value = flMinPanel.value;
+                if (flMax && flMaxPanel) flMax.value = flMaxPanel.value;
+                saveDelayPrefs();
+            };
+        });
+
+        if (!window._truUiIntervalId) {
+        window._truUiIntervalId = setInterval(() => {
             const icon = document.getElementById('tiktok-minimized-icon');
             const liveInfo = getUserInfo();
 
-            if (!isProfile || !liveInfo.isOwnProfile) {
+            if (!liveInfo.loggedIn) {
                 if (ui) ui.style.display = 'none';
                 if (icon) icon.style.display = 'none';
                 return;
-            } else {
-                if (ui && ui.style.display === 'none' && (!icon || icon.style.display === 'none')) {
-                    if (icon) icon.style.display = 'block';
-                }
+            }
+
+            if (icon && ui && ui.style.display === 'none') {
+                icon.style.display = 'flex';
             }
 
             const header = document.getElementById('ui-header');
             const statusBadge = document.getElementById('ui-profile-status');
             const delBtn = document.getElementById('del-all-btn');
             const unfavBtn = document.getElementById('unfav-all-btn');
+            const flFlowBtn = document.getElementById('btn-fl-full-flow');
 
             if (header) {
-                if (liveInfo.isOwnProfile) {
+                const bulkOn = !!(liveInfo.canBulkActions);
+                if (liveInfo.pageKind === 'feed') {
+                    if (liveInfo.needsProfileSync) {
+                        header.style.background = 'linear-gradient(to bottom, rgba(251,191,36,0.12), transparent)';
+                        header.style.borderTop = '4px solid #fbbf24';
+                        if (statusBadge) {
+                            statusBadge.innerText = 'HỒ SƠ';
+                            statusBadge.style.background = '#fbbf24';
+                            statusBadge.style.color = '#111';
+                        }
+                    } else {
+                        header.style.background = 'linear-gradient(to bottom, rgba(147,112,219,0.12), transparent)';
+                        header.style.borderTop = '4px solid #a78bfa';
+                        if (statusBadge) {
+                            statusBadge.innerText = 'FYP';
+                            statusBadge.style.background = '#a78bfa';
+                            statusBadge.style.color = '#fff';
+                        }
+                    }
+                } else if (liveInfo.isOwnProfile) {
                     header.style.background = 'linear-gradient(to bottom, rgba(37,244,238,0.15), transparent)';
                     header.style.borderTop = '4px solid #25F4EE';
                     if (statusBadge) {
@@ -281,8 +2092,6 @@ function () {
                         statusBadge.style.background = '#25F4EE';
                         statusBadge.style.color = '#000';
                     }
-                    if (delBtn) delBtn.disabled = false;
-                    if (unfavBtn) unfavBtn.disabled = false;
                 } else {
                     header.style.background = 'linear-gradient(to bottom, rgba(254,44,85,0.15), transparent)';
                     header.style.borderTop = '4px solid #FE2C55';
@@ -291,18 +2100,76 @@ function () {
                         statusBadge.style.background = '#FE2C55';
                         statusBadge.style.color = '#fff';
                     }
-                    if (delBtn) delBtn.disabled = true;
-                    if (unfavBtn) unfavBtn.disabled = true;
                 }
+                if (delBtn) delBtn.disabled = !bulkOn;
+                if (unfavBtn) unfavBtn.disabled = !bulkOn;
+                if (flFlowBtn) flFlowBtn.disabled = !bulkOn;
             }
 
-            updateL();
-        }, 2000);
+            refreshTruViewerPanel();
 
-        ['repost', 'fav', 'like', 'follow', 'settings'].forEach(t => {
+            updateL();
+        }, 2800);
+        }
+
+        ['repost', 'fav', 'like', 'dl', 'follow', 'settings'].forEach(t => {
             const b = document.getElementById('tab-' + t);
             if (b) b.onclick = () => switchT(t);
         });
+
+        const truVidBtn = document.getElementById('tru-btn-dl-video');
+        if (truVidBtn) {
+            truVidBtn.onclick = async () => {
+                const statusEl = document.getElementById('tru-dl-status');
+                const { awemeId, item, video } = getTruFocusedAweme({ force: true });
+                let url = item ? truPickVideoDownloadUrl(item) : null;
+                const filename = `tiktok_${awemeId || 'video'}.mp4`;
+                if (!url && video) {
+                    const vsrc = video.currentSrc || video.src || '';
+                    if (vsrc && (/^https?:/i.test(vsrc) || /^blob:/i.test(vsrc))) {
+                        url = vsrc;
+                        if (statusEl) {
+                            statusEl.textContent = /^blob:/i.test(vsrc)
+                                ? '📎 Tải từ luồng blob (trình phát) — thường có watermark.'
+                                : '📎 Dùng URL luồng đang phát — thường có watermark.';
+                        }
+                    }
+                }
+                if (!url) {
+                    const n = Object.keys(window.truAwemeById || {}).length;
+                    if (statusEl) {
+                        statusEl.textContent = n === 0
+                            ? 'Chưa có URL — extension chưa bắt được item_list (thử vuốt FYP, F5, hoặc mở trang /video/id).'
+                            : 'Chưa khớp clip với metadata — vuốt qua clip này lần nữa hoặc mở đúng link /video/id.';
+                    }
+                    return;
+                }
+                await truBlobDownload(url, filename, statusEl, '✅ Đã tải xong.', '⚠️ ');
+            };
+        }
+        const truPhBtn = document.getElementById('tru-btn-dl-photos');
+        if (truPhBtn) {
+            truPhBtn.onclick = async () => {
+                const statusEl = document.getElementById('tru-dl-status');
+                const { awemeId, item } = getTruFocusedAweme({ force: true });
+                const urls = truMergePhotoDownloadUrls(item, window.location.pathname || '');
+                if (!urls.length) {
+                    if (statusEl) {
+                        statusEl.textContent = 'Chưa thấy URL ảnh — F5; hoặc mở đúng /photo/id; carousel cần metadata item_list.';
+                    }
+                    refreshTruViewerPanel();
+                    return;
+                }
+                if (statusEl) statusEl.textContent = `⏳ Tải ${urls.length} ảnh…`;
+                for (let i = 0; i < urls.length; i++) {
+                    const u = urls[i];
+                    const fn = `tiktok_${awemeId || 'photo'}_${i + 1}${truPhotoFilenameSuffix(u)}`;
+                    await truBlobDownload(u, fn, null, '', '');
+                    await new Promise(r => setTimeout(r, 280));
+                }
+                if (statusEl) statusEl.textContent = `✅ Đã tải ${urls.length} ảnh.`;
+            };
+        }
 
 
 
@@ -310,7 +2177,7 @@ function () {
         if (delBtn) {
             delBtn.onclick = async () => {
                 if (!window.allRepostVideos.length) return;
-                const b = delBtn; const delay = parseInt(slider.value) || 1200; b.disabled = true;
+                const b = delBtn; const delay = getProcessingDelayMs(); b.disabled = true;
                 for (let i = 0; i < window.allRepostVideos.length; i++) {
                     const item = window.allRepostVideos[i]; const id = item.id || item.aweme_id;
                     b.innerText = `⏳ ĐANG XÓA ${i + 1}/${window.allRepostVideos.length}`;
@@ -331,13 +2198,8 @@ function () {
             };
         }
 
-        const expBtn = document.getElementById('exp-f');
-        if (expBtn) {
-            expBtn.onclick = () => {
-                const txt = window.allFollowers.map(f => `@${f.user?.uniqueId || f.uniqueId}`).join('\n');
-                navigator.clipboard.writeText(txt).then(() => alert("Đã sao chép!"));
-            };
-        }
+        const btnFlFlow = document.getElementById('btn-fl-full-flow');
+        if (btnFlFlow) btnFlFlow.onclick = async () => { await runFlFullUnfollowFlow(btnFlFlow); };
 
 
         // --- DRAG & MINIMIZE LOGIC ---
@@ -360,27 +2222,30 @@ function () {
         const miniIcon = document.createElement('div');
         miniIcon.id = 'tiktok-minimized-icon';
         miniIcon.title = 'Mở lại menu';
-        miniIcon.style.backgroundImage = `url('${info.avatar}')`;
-        miniIcon.style.display = 'block'; // Default visible
+        miniIcon.innerHTML = '<span class="tiktok-mini-wave" aria-hidden="true"></span><span class="tiktok-mini-wave tiktok-mini-wave--2" aria-hidden="true"></span><span class="tiktok-mini-wave tiktok-mini-wave--3" aria-hidden="true"></span><canvas id="tru-mini-wave-canvas" aria-hidden="true"></canvas><img id="tiktok-mini-avatar" class="tiktok-mini-avatar" alt="">';
+        const miniAv = miniIcon.querySelector('#tiktok-mini-avatar');
+        if (miniAv) {
+            miniAv.src = info.avatar || defUser;
+            miniAv.onerror = () => { miniAv.src = defUser; };
+        }
         document.body.appendChild(miniIcon);
-
-        ui.style.display = 'none'; // Default hidden
 
         document.getElementById('minimize-ui').onclick = () => {
             ui.style.display = 'none';
-            miniIcon.style.display = 'block';
+            miniIcon.style.display = 'flex';
         };
         miniIcon.onclick = () => {
             ui.style.display = 'flex';
             miniIcon.style.display = 'none';
         };
-        // Also make mini icon movable
         makeMovable(miniIcon, miniIcon);
+
+        startTiktokMusicPulse();
 
         // Auto-refresh info once after loading to catch lazy-loaded avatars
         setTimeout(() => {
             const newInfo = getUserInfo();
-            const avatarEl = document.getElementById('user-avatar-img');
+            const avatarEl = document.getElementById('ui-user-avatar');
             if (avatarEl && newInfo.avatar && avatarEl.src !== newInfo.avatar) {
                 avatarEl.src = newInfo.avatar;
             }
@@ -390,16 +2255,26 @@ function () {
     function updateL() {
         if (!document.getElementById('tiktok-repost-ui')) createUI();
         const info = getUserInfo();
-        const ui = document.getElementById('tiktok-repost-ui');
+        let ui = document.getElementById('tiktok-repost-ui');
+
+        if (info.loggedIn && ui && ui.querySelector('.logged-out-wrap')) {
+            const mini = document.getElementById('tiktok-minimized-icon');
+            ui.remove();
+            if (mini) mini.remove();
+            createUI();
+            ui = document.getElementById('tiktok-repost-ui');
+        }
 
         if (!info.loggedIn) {
             if (ui && !ui.innerHTML.includes('🔒')) {
                 ui.innerHTML = `
-                    <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;gap:20px;padding:40px;text-align:center;">
-                        <div style="font-size:60px;">🔒</div>
-                        <div style="font-size:20px;font-weight:900;color:#FE2C55;">CHƯA ĐĂNG NHẬP</div>
-                        <div style="font-size:12px;opacity:0.5;">Vui lòng đăng nhập vào TikTok để sử dụng các tính năng của công cụ.</div>
-                        <button onclick="location.reload()" style="background:#FE2C55;color:#fff;border:none;padding:12px 24px;border-radius:15px;font-weight:900;cursor:pointer;margin-top:10px;">THỬ LẠI</button>
+                    <div class="logged-out-wrap" style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;gap:14px;padding:24px;text-align:center;box-sizing:border-box;">
+                        <div style="font-size:48px;line-height:1;">🔒</div>
+                        <div class="pk-card" style="max-width:260px;padding:16px;display:flex;flex-direction:column;gap:10px;align-items:center;">
+                            <div style="font-size:15px;font-weight:700;color:#FE2C55;letter-spacing:-0.02em;">CHƯA ĐĂNG NHẬP</div>
+                            <div class="pk-hint" style="text-align:center;margin:0;">Đăng nhập TikTok để dùng công cụ.</div>
+                            <button type="button" onclick="location.reload()" class="main-action" style="margin-top:4px;width:100%;">Thử lại</button>
+                        </div>
                     </div>
                 `;
             }
@@ -407,16 +2282,31 @@ function () {
         }
 
         const headerImg = document.getElementById('ui-user-avatar');
-        const miniIcon = document.getElementById('tiktok-minimized-icon');
         const nick = document.getElementById('ui-user-nickname');
         const user = document.getElementById('ui-user-username');
 
         if (headerImg && info.avatar && info.avatar.includes('http') && !headerImg.src.includes(info.avatar.split('?')[0])) {
             headerImg.src = info.avatar;
-            if (miniIcon) miniIcon.style.backgroundImage = `url('${info.avatar}')`;
+            const miniA = document.getElementById('tiktok-mini-avatar');
+            if (miniA) miniA.src = info.avatar;
         }
-        if (nick && info.nickname !== 'Người dùng TikTok') nick.innerText = info.nickname;
-        if (user && info.username !== '@unknown') user.innerText = info.username;
+        if (nick) nick.innerText = info.nickname;
+        if (user) user.innerText = info.username;
+
+        const statGridEl = ui.querySelector('.stat-grid');
+        const syncBanner = document.getElementById('tru-sync-banner');
+        if (info.needsProfileSync && statGridEl) {
+            if (!syncBanner) {
+                const b = document.createElement('div');
+                b.id = 'tru-sync-banner';
+                b.className = 'pk-card';
+                b.style.cssText = 'margin-left:10px;margin-right:10px;margin-bottom:8px;margin-top:2px;padding:9px 11px;background:rgba(251,191,36,0.08);border:1px solid rgba(251,191,36,0.4);flex-shrink:0;font-size:9px;line-height:1.45;color:rgba(255,255,255,0.9);';
+                b.innerHTML = '<strong style="color:#fcd34d;display:block;margin-bottom:4px;">Chỉ một lần sau khi cài</strong>Mở trang <span style="color:#25F4EE;font-weight:800">Hồ sơ của bạn</span> để lưu avatar & số liệu; sau đó dùng Repost / Unfav / FL ở mọi trang (kể cả FYP).';
+                statGridEl.parentNode.insertBefore(b, statGridEl);
+            }
+        } else if (syncBanner) {
+            syncBanner.remove();
+        }
 
         const rl = document.getElementById('repost-list');
         if (rl && window.allRepostVideos.length > rl.children.length) {
@@ -451,12 +2341,19 @@ function () {
                 b.onclick = () => window.unlikeTiktokVideo(id, b); c.appendChild(b); ll.appendChild(c);
             });
         }
-        const fll = document.getElementById('follow-list');
-        if (fll && window.allFollowers.length > fll.children.length) {
-            window.allFollowers.slice(fll.children.length).forEach(f => {
-                const u = f.user || f; const c = document.createElement('div'); c.className = 'item-glass';
+        const fgl = document.getElementById('following-list');
+        if (fgl && window.allFollowing.length > fgl.children.length) {
+            window.allFollowing.slice(fgl.children.length).forEach(entry => {
+                const u = entry.user || entry;
+                const sec = u.secUid || u.sec_uid;
+                const uid = u.uniqueId || u.unique_id || '';
+                if (!sec || !uid || document.getElementById(safeUnfBtnId(sec))) return;
+                const c = document.createElement('div'); c.className = 'item-glass';
                 c.innerHTML = `<div style="display:flex;align-items:center;gap:15px;min-width:0;flex-grow:1;"><img src="${u.avatarThumb}" style="width:42px;height:42px;border-radius:15px;background:#222;border:1px solid rgba(255,255,255,0.1);flex-shrink:0;"><div style="overflow:hidden;min-width:0;flex-grow:1;"><div style="font-size:13px;font-weight:900;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${u.nickname}</div><div style="font-size:10px;color:var(--pk-cyan);font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">@${u.uniqueId}</div></div></div>`;
-                fll.appendChild(c);
+                const b = document.createElement('button'); b.id = safeUnfBtnId(sec); b.style.cssText = 'background:rgba(255,255,255,0.06);border:none;color:#fff;width:42px;height:42px;border-radius:12px;font-size:16px;cursor:pointer;transition:all 0.2s;flex-shrink:0;'; b.innerText = '🚫';
+                b.onmouseover = () => { b.style.background = 'rgba(254,44,85,0.2)'; b.style.transform = 'scale(1.1)'; }; b.onmouseout = () => { b.style.background = 'rgba(255,255,255,0.06)'; b.style.transform = 'scale(1)'; };
+                b.onclick = () => unfollowTiktokUserDom(uid, b);
+                c.appendChild(b); fgl.appendChild(c);
             });
         }
     }
@@ -467,17 +2364,37 @@ function () {
 
         const isRepost = url.includes('/api/repost/item_list/');
         const isFav = url.includes('/api/user/collect/item_list/');
-        const isFollow = url.includes('/api/user/list/');
+        let isFollowingApi = url.includes('/api/user/following') || url.includes('following/list');
+        if (url.includes('/api/user/list/')) {
+            try {
+                const lu = url.startsWith('http') ? url : location.origin + url;
+                const uu = new URL(lu);
+                const scene = (uu.searchParams.get('scene') || '').toLowerCase();
+                if (scene === 'following') isFollowingApi = true;
+            } catch (err) { }
+        }
 
-        if (isRepost || isFav || isFollow) {
+        const truFeedApi = truIsLikelyAwemeFeedApi(url);
+        if (truFeedApi) {
+            res.clone().json().then((d) => {
+                truProcessFeedJsonPayload(d);
+            }).catch(() => { });
+        }
+
+        if (isRepost || isFav || isFollowingApi) {
             res.clone().json().then(d => {
                 if (d.itemList) {
+                    truIngestAwemeItems(d.itemList);
                     if (isRepost) { window.allRepostVideos.push(...d.itemList); }
                     if (isFav) { window.allFavorites.push(...d.itemList); }
                     updateL();
                 }
-                if (isFollow && d.userList) {
-                    window.allFollowers.push(...d.userList);
+                if (isFollowingApi && d.userList) {
+                    try {
+                        const lu = url.startsWith('http') ? url : location.origin + url;
+                        window.tiktokLastFollowingUrlObj = new URL(lu);
+                    } catch (err) { }
+                    dedupeFollowingPush(d.userList);
                     updateL();
                 }
                 if (isRepost) {
@@ -488,5 +2405,18 @@ function () {
         return res;
     };
 
-    document.addEventListener('click', () => { if (window.tiktokExtensionActivated) return; window.tiktokExtensionActivated = true; createUI(); updateL(); }, { once: true });
+    function activateExtensionUI() {
+        if (window.tiktokExtensionActivated) return;
+        window.tiktokExtensionActivated = true;
+        createUI();
+        updateL();
+    }
+
+    setTimeout(() => {
+        try {
+            if (getUserInfo().loggedIn) activateExtensionUI();
+        } catch (e) { /* đợi DOM TikTok */ }
+    }, 2000);
+
+    document.addEventListener('click', () => { activateExtensionUI(); }, { once: true });
 })();
